@@ -1,0 +1,34 @@
+{
+  "app": "uv run --no-project python app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": [
+      "README.md",
+      "cdk.out",
+      "**/__pycache__",
+      "**/*.pyc"
+    ]
+  },
+  "context": {
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:target-partitions": ["aws", "aws-cn"],
+
+    "// domain config": "hosted_zone_id is the Route 53 zone we delegated from Squarespace; domain_name is the FQDN the chat UI will live at. Both are needed for the Cognito + HTTPS setup. See agent README 'Setting up a domain and SSO' for how to provision the hosted zone.",
+    "hosted_zone_id": "Z0998538SK4XX0B7AC04",
+    "domain_name": "dataagent.gpnkv.com",
+
+    "// agent-runtime config": "Values below are read by the Compute stack via self.node.try_get_context() and injected into the agent task's env. Override per-deploy with --context key=value, or pin account-specific values (role ARNs, S3 bucket URIs) in ~/.cdk.json so they don't end up in the repo.",
+    "model_id": "eu.anthropic.claude-sonnet-4-6",
+    "target_repo_default_branch": "main",
+    "glue_job_role_arn": "",
+    "scheduler_athena_exec_role_arn": "",
+    "glue_job_default_script_s3": "",
+    "glue_temp_dir": "",
+    "athena_database": "",
+    "athena_table": "",
+    "target_repo_owner": "",
+    "target_repo_name": "",
+    "raw_data_bucket_s3_uri": ""
+  }
+}

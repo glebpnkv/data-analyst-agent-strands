@@ -1,0 +1,29 @@
+version: 1
+
+# Every Glue job deployed by this repo is declared here.
+# deploy.py reads this file and creates or updates each job in AWS.
+#
+# Required per entry:
+#   name:          Glue job name in AWS (kebab-case).
+#   type:          "python_shell" or "pyspark".
+#   path:          Folder under jobs/, e.g. jobs/customer_report.
+#   entrypoint:    Filename of the bootloader, usually entrypoint.py.
+#   description:   One-line human-readable description.
+#
+# Sizing:
+#   python_shell:  max_capacity (0.0625 or 1.0).
+#   pyspark:       worker_type + number_of_workers.
+#
+# Optional:
+#   glue_version:      "5.0" for pyspark (default), "3.0" for python_shell (default).
+#   timeout_minutes:   Glue timeout. Default 60.
+#   default_arguments: Map of --key: value pairs merged into Glue DefaultArguments.
+#                      --extra-py-files is injected automatically from the wheel.
+#   schedule:          { cron: "...", timezone: "UTC" } to register an EventBridge schedule.
+#                      Omit for on-demand jobs.
+#
+# Intentionally empty on day one. The `jobs/example_*/` directories exist so
+# the `test` and `build-wheels` CI steps have something to exercise, but
+# nothing here means nothing deploys. Add entries as real jobs are built.
+
+jobs: []

@@ -1,0 +1,31 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.whl
+*.tar.gz
+
+# Caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Secrets and local config
+.env
+.env.*
+!.env.template
+
+# OS clutter
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

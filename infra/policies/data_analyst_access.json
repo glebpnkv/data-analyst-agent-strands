@@ -1,0 +1,115 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "GlueJobAndRunManagement",
+      "Effect": "Allow",
+      "Action": [
+        "glue:CreateJob",
+        "glue:UpdateJob",
+        "glue:DeleteJob",
+        "glue:GetJob",
+        "glue:GetJobs",
+        "glue:StartJobRun",
+        "glue:StopJobRun",
+        "glue:BatchStopJobRun",
+        "glue:GetJobRun",
+        "glue:GetJobRuns",
+        "glue:GetJobBookmark",
+        "glue:ResetJobBookmark"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "GlueSchedulingWorkflowAndCrawlerManagement",
+      "Effect": "Allow",
+      "Action": [
+        "glue:CreateTrigger",
+        "glue:UpdateTrigger",
+        "glue:DeleteTrigger",
+        "glue:GetTrigger",
+        "glue:GetTriggers",
+        "glue:StartTrigger",
+        "glue:StopTrigger",
+        "glue:CreateWorkflow",
+        "glue:UpdateWorkflow",
+        "glue:DeleteWorkflow",
+        "glue:GetWorkflow",
+        "glue:GetWorkflows",
+        "glue:StartWorkflowRun",
+        "glue:CreateCrawler",
+        "glue:UpdateCrawler",
+        "glue:DeleteCrawler",
+        "glue:GetCrawler",
+        "glue:GetCrawlers",
+        "glue:BatchGetCrawlers",
+        "glue:ListCrawlers",
+        "glue:StartCrawler",
+        "glue:StopCrawler"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "GlueMetadataTagging",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetTags",
+        "glue:TagResource",
+        "glue:UntagResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "GlueCatalogDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase",
+        "glue:GetDatabases",
+        "glue:GetTable",
+        "glue:GetTables",
+        "glue:GetPartition",
+        "glue:GetPartitions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3ScriptAndArtifactAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListBucketMultipartUploads",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*",
+        "arn:aws:s3:::*/*"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogsReadForGlueDiagnostics",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowPassRoleToGlue",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "glue.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

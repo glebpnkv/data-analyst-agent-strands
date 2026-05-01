@@ -1,0 +1,53 @@
+# Repo-root .dockerignore.
+#
+# `agent/Dockerfile` and `frontend/Dockerfile` both build with the
+# repo root as the build context (`docker build -f agent/Dockerfile .`).
+# Without this file, Docker would ship the entire repo to the daemon
+# before the first `COPY` runs — including the 1+ GB `.venv` — which
+# looks like the build is hung for 30+ seconds before any output.
+#
+# Per-service `.dockerignore`s under `agent/` and `frontend/` are NOT
+# consulted by Docker when the build context is the repo root; only
+# this root file is. Treat those per-service files as historical.
+
+# Local virtualenv (huge, slow, never needed in the image — Docker
+# rebuilds deps via `uv sync` from pyproject.toml + uv.lock anyway).
+.venv/
+venv/
+env/
+
+# Source control + CI scratch
+.git/
+.github/
+infra/cdk.out/
+infra/cdk.context.json
+
+# Caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local-only state
+.env
+.env.*
+!*.env.template
+*.log
+runs/
+.bedrock_agentcore/
+.bedrock_agentcore.yaml
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+
+# Other agents' homes don't belong in this repo's images
+# (kept here as documentation; this repo only has one agent now).

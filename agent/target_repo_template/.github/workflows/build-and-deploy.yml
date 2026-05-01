@@ -1,0 +1,88 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run per-job tests
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for d in jobs/*/; do
+            job=$(basename "$d")
+            echo "::group::Testing $job"
+            python -m venv ".venv-$job"
+            # shellcheck disable=SC1090
+            source ".venv-$job/bin/activate"
+            # Upgrade setuptools alongside pip: newer pip editable installs
+            # need `setuptools.backends.legacy`, only present in setuptools>=74.
+            pip install --quiet --upgrade pip setuptools wheel
+            pip install --quiet -e "$d[dev]"
+            (cd "$d" && pytest tests/ -q)
+            deactivate
+            rm -rf ".venv-$job"
+            echo "::endgroup::"
+          done
+
+  build-wheels:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build all job wheels
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pip install --quiet build
+          mkdir -p dist/
+          for d in jobs/*/; do
+            job=$(basename "$d")
+            echo "::group::Building $job"
+            (cd "$d" && python -m build --wheel --outdir "../../dist/$job/")
+            cp "$d/entrypoint.py" "dist/$job/"
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-wheels
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Install deploy deps
+        run: pip install --quiet -r deploy/requirements.txt
+      - name: Deploy
+        env:
+          GLUE_ASSETS_BUCKET: ${{ secrets.GLUE_ASSETS_BUCKET }}
+          GLUE_JOB_ROLE_ARN: ${{ secrets.GLUE_JOB_ROLE_ARN }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: python deploy/deploy.py --region "$AWS_REGION"
