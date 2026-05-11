@@ -10,7 +10,7 @@ The agent runs as a FastAPI service behind a Chainlit chat UI, with Phoenix for 
 
 Other prerequisites:
 - AWS credentials for a dev account (profile configured in `~/.aws/config` or via env vars).
-- Python 3.13+ and `uv` to install dependencies.
+- Python 3.11+ and `uv` to install dependencies.
 - Outbound HTTPS to `api.githubcopilot.com` (the agent uses GitHub's hosted MCP server; no local install).
 - Access to Bedrock in the configured region for the chosen model.
 - For deployment: Docker Desktop, the AWS CDK CLI (`npm install -g aws-cdk`), and the Session Manager plugin (`brew install --cask session-manager-plugin` on macOS).

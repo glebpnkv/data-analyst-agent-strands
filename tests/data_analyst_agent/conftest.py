@@ -10,5 +10,6 @@ AGENT_ROOT = REPO_ROOT / "agent"
 for mod in [m for m in sys.modules if m == "utils" or m.startswith("utils.")]:
     del sys.modules[mod]
 
-sys.path[:] = [p for p in sys.path if p != str(AGENT_ROOT)]
+sys.path[:] = [p for p in sys.path if p not in (str(AGENT_ROOT), str(REPO_ROOT))]
 sys.path.insert(0, str(AGENT_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
