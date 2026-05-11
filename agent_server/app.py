@@ -1,5 +1,7 @@
 import logging
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from typing import Protocol, runtime_checkable
 
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -17,6 +19,22 @@ from .ui_emitter import UIEmitter, reset_current_emitter, set_current_emitter
 log = logging.getLogger(__name__)
 
 
+@runtime_checkable
+class LifespanResource(Protocol):
+    """Anything with `start()` and `shutdown()` async methods.
+
+    Used by `create_app` to weave per-process resources (e.g. a
+    SandboxPool that needs to warm before the first chat session, or a
+    background watcher) into the FastAPI lifespan. Resources are
+    started in order before `yield` and shut down in reverse order.
+    Started resources are cleaned up even if a later resource's
+    `start()` raises, so a half-warmed boot doesn't leak.
+    """
+
+    async def start(self) -> None: ...
+    async def shutdown(self) -> None: ...
+
+
 class ChatRequest(BaseModel):
     session_id: str | None = Field(default=None)
     prompt: str = Field(min_length=1)
@@ -29,16 +47,25 @@ def create_app(
     settings: BaseSettings | None = None,
     title: str = "agent-service",
     version: str = "0.1.0",
+    lifespan_resources: Sequence[LifespanResource] | None = None,
 ) -> FastAPI:
     """Build a FastAPI app that streams the v1 SSE protocol over /v1/chat.
 
     Args:
-        agent_factory: Callable invoked per-session to build the agent.
+        agent_factory: Async callable invoked per-session to build the
+            agent. Awaited inside the request handling /v1/chat call.
         reducer_factory: Callable invoked per-request to build a fresh reducer.
         settings: Optional preloaded settings; defaults to `load_base_settings()`.
         title, version: FastAPI metadata.
+        lifespan_resources: Optional list of objects with async `start()`
+            and `shutdown()`. Started in order before the app accepts
+            traffic; shut down in reverse on app exit. Use this for
+            things the agent factory will reach into per-request
+            (sandbox pool, connection pool, etc) so they're warm by
+            the time the first request lands.
     """
     resolved_settings = settings or load_base_settings()
+    resources: list[LifespanResource] = list(lifespan_resources or [])
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -48,14 +75,36 @@ def create_app(
                 "AGENT_SERVICE_AUTH_SECRET is unset — /v1/chat is unauthenticated. "
                 "Acceptable only for local development."
             )
+        # Start resources in declared order, tracking which ones
+        # succeeded so we can unwind cleanly if a later one fails.
+        started: list[LifespanResource] = []
+        try:
+            for resource in resources:
+                await resource.start()
+                started.append(resource)
+        except Exception:
+            for resource in reversed(started):
+                try:
+                    await resource.shutdown()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("lifespan resource shutdown raised during failed boot: %s", e)
+            observability.close()
+            raise
+
         registry = SessionRegistry(resolved_settings, agent_factory)
         app.state.settings = resolved_settings
         app.state.registry = registry
         app.state.observability = observability
+        app.state.lifespan_resources = resources
         try:
             yield
         finally:
             await registry.shutdown()
+            for resource in reversed(started):
+                try:
+                    await resource.shutdown()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("lifespan resource shutdown raised: %s", e)
             observability.close()
 
     app = FastAPI(title=title, version=version, lifespan=lifespan)
