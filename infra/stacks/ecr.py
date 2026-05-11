@@ -26,6 +26,7 @@ from constructs import Construct
 # the console.
 AGENT_REPO_NAME = "data-analyst-agent/agent"
 FRONTEND_REPO_NAME = "data-analyst-agent/frontend"
+SANDBOX_REPO_NAME = "data-analyst-agent/sandbox"
 
 
 class EcrStack(cdk.Stack):
@@ -64,6 +65,13 @@ class EcrStack(cdk.Stack):
             **common,
         )
 
+        self.sandbox_repo = ecr.Repository(
+            self,
+            "SandboxRepo",
+            repository_name=SANDBOX_REPO_NAME,
+            **common,
+        )
+
         # SSM Parameter Store is the indirection point; deploy.sh reads
         # repo URIs from SSM rather than parsing CloudFormation outputs.
         # We write these from THIS stack (not Compute) so that
@@ -82,6 +90,12 @@ class EcrStack(cdk.Stack):
             parameter_name=f"{ssm_prefix}/frontend/repo-uri",
             string_value=self.frontend_repo.repository_uri,
         )
+        ssm.StringParameter(
+            self,
+            "SandboxRepoUriParam",
+            parameter_name=f"{ssm_prefix}/sandbox/repo-uri",
+            string_value=self.sandbox_repo.repository_uri,
+        )
 
         # CFN outputs for human inspection of the deployed stack.
         cdk.CfnOutput(
@@ -95,4 +109,10 @@ class EcrStack(cdk.Stack):
             "FrontendRepoUri",
             value=self.frontend_repo.repository_uri,
             description="`docker push` this URI to publish a new frontend image",
+        )
+        cdk.CfnOutput(
+            self,
+            "SandboxRepoUri",
+            value=self.sandbox_repo.repository_uri,
+            description="`docker push` this URI to publish a new sandbox image",
         )

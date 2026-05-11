@@ -39,7 +39,36 @@ tmp/analysis_outputs/
 └── images/        # PNG / JPEG / SVG image files
 ```
 
-Create the parent directory once per session if it doesn't exist:
+### CRITICAL path rules — read these before writing any file
+
+The single most common failure here is the LLM picking the wrong
+path convention, watching the write silently fail, and then handing
+the `display_*` tool a path that doesn't exist (404). To avoid that:
+
+1. **NEVER use `~` in any path.** Python's `open()` does NOT expand
+   `~` to a home directory. Writing `fig.write_json("~/foo.json")`
+   tries to create a literal `~` subdirectory — which doesn't exist,
+   so the call raises `FileNotFoundError` and you don't notice. Same
+   for `pd.read_csv("~/...")`, `plt.savefig("~/...")`, etc. **Always
+   use a relative path starting with `tmp/analysis_outputs/...`.**
+
+2. **NEVER use absolute paths** like `/workspace/...` or `/tmp/...`.
+   The recipes below use workspace-relative paths and the sandbox is
+   already running with `/workspace` as its current working
+   directory.
+
+3. **ALWAYS `os.makedirs(..., exist_ok=True)` first.** Plotly's
+   `write_json`, matplotlib's `savefig`, and `pandas.to_csv` all
+   refuse to create parent directories — they raise
+   `FileNotFoundError` if the directory tree isn't there. The skill's
+   one-time-per-session mkdir block (just below) covers all three
+   subdirectories at once.
+
+4. **Use the EXACT same path string in `write_*` and `display_*`.**
+   Don't normalize, don't change separators, don't add or remove
+   leading dots. Copy-paste the literal string.
+
+Create the parent directories once per session if they don't exist:
 
 ```python
 import os

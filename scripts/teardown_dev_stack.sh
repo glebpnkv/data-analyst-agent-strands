@@ -68,6 +68,47 @@ if [[ "${confirm}" != "yes" ]]; then
   exit 1
 fi
 
+# Sandbox tasks are launched standalone via ecs:RunTask (NOT as part
+# of an ECS service), so CFN doesn't know about them. If any are still
+# running when we destroy the cluster, the deletion can hang. Stop
+# them defensively before cdk destroy.
+#
+# We look up the cluster name from SSM rather than CFN outputs so this
+# step still works after a previous half-failed teardown (where the
+# Compute stack might be partially gone but tasks linger).
+SANDBOX_CLUSTER="$(
+  aws ssm get-parameter \
+    --region "${REGION}" \
+    --name "/data-analyst-agent/$(echo "${STAGE}" | tr '[:upper:]' '[:lower:]')/cluster-name" \
+    --query 'Parameter.Value' --output text 2>/dev/null || true
+)"
+if [[ -n "${SANDBOX_CLUSTER}" ]]; then
+  echo "Stopping any leftover sandbox tasks in cluster ${SANDBOX_CLUSTER}..."
+  # `--family` filter narrows by task definition family. The `|| true`
+  # handles the case where the family no longer exists (already torn down).
+  SANDBOX_TASKS="$(
+    aws ecs list-tasks \
+      --region "${REGION}" \
+      --cluster "${SANDBOX_CLUSTER}" \
+      --family "DataAnalystSandbox-${STAGE}" \
+      --desired-status RUNNING \
+      --query 'taskArns' --output text 2>/dev/null || true
+  )"
+  if [[ -n "${SANDBOX_TASKS// /}" && "${SANDBOX_TASKS}" != "None" ]]; then
+    for task_arn in ${SANDBOX_TASKS}; do
+      echo "  - StopTask ${task_arn}"
+      aws ecs stop-task \
+        --region "${REGION}" \
+        --cluster "${SANDBOX_CLUSTER}" \
+        --task "${task_arn}" \
+        --reason "teardown" \
+        --output text >/dev/null 2>&1 || true
+    done
+  else
+    echo "  (none running — nothing to do)"
+  fi
+fi
+
 cd "${INFRA_DIR}"
 cdk destroy --all --force
 

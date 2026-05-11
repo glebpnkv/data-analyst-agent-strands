@@ -35,6 +35,7 @@ ALB_HTTP_PORT = 80
 ALB_HTTPS_PORT = 443
 FRONTEND_HTTP_PORT = 8000
 AGENT_HTTP_PORT = 8080
+SANDBOX_HTTP_PORT = 8081
 POSTGRES_PORT = 5432
 
 
@@ -103,6 +104,21 @@ class NetworkStack(cdk.Stack):
             allow_all_outbound=True,
         )
 
+        # Sandbox tasks live behind no ALB — the agent claims them
+        # directly via private IP and ecs:RunTask. Only the agent task
+        # SG can reach them. Outbound is open so the sandbox can pull
+        # PyPI deps if SANDBOX_INSTALL_PACKAGES_ENABLED ever flips on,
+        # and so the kernel can phone home for any user-requested
+        # network operation; in practice the LLM-authored code is the
+        # only thing that ever uses it.
+        self.sandbox_task_sg = ec2.SecurityGroup(
+            self,
+            "SandboxTaskSg",
+            vpc=self.vpc,
+            description="Sandbox ECS tasks. Reachable only from agent tasks; never an ALB.",
+            allow_all_outbound=True,
+        )
+
         self.rds_sg = ec2.SecurityGroup(
             self,
             "RdsSg",
@@ -154,6 +170,13 @@ class NetworkStack(cdk.Stack):
             peer=self.agent_alb_sg,
             connection=ec2.Port.tcp(AGENT_HTTP_PORT),
             description="Agent ALB to agent tasks",
+        )
+
+        # Sandbox tasks accept HTTP only from agent tasks (no ALB).
+        self.sandbox_task_sg.add_ingress_rule(
+            peer=self.agent_task_sg,
+            connection=ec2.Port.tcp(SANDBOX_HTTP_PORT),
+            description="Agent tasks to sandbox tasks (per-session HTTP)",
         )
 
         self.rds_sg.add_ingress_rule(
