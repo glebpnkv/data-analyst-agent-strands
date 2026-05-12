@@ -6,7 +6,7 @@ from typing import Optional
 
 import boto3
 from mcp import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, AgentSkills
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
@@ -230,7 +230,7 @@ def make_github_mcp_client() -> MCPClient:
     headers = {"Authorization": f"Bearer {pat}"}
 
     return MCPClient(
-        lambda: streamablehttp_client(
+        lambda: streamable_http_client(
             url=GITHUB_MCP_SERVER_URL,
             headers=headers,
         ),
@@ -353,7 +353,7 @@ def make_agent(
     sandbox_auth_token: Optional[str] = None,
 ) -> tuple[Agent, Optional[str], Optional[RemoteSandboxCodeInterpreter]]:
     """
-    Create the Strands Glue pipeline agent.
+    Create the Data Analyst Strands agent.
 
     Used by both local CLI mode and the FastAPI runtime. The code
     interpreter is attached only when both `sandbox_http_url` and
@@ -398,7 +398,7 @@ def make_agent(
     if sandbox_http_url and sandbox_auth_token:
         # Per-call session name purely for log correlation; the kernel is
         # one-per-task so the name doesn't gate state isolation.
-        ci_session_name = f"glue-pipeline-{uuid.uuid4().hex[:10]}"
+        ci_session_name = f"data-analyst-{uuid.uuid4().hex[:10]}"
         code_interpreter_tool = RemoteSandboxCodeInterpreter(
             http_url=sandbox_http_url,
             auth_token=sandbox_auth_token,

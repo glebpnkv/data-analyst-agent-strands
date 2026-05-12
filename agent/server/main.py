@@ -227,7 +227,7 @@ _lifespan_resources = [_pool] if _pool is not None else []
 app = create_app(
     agent_factory=_build_managed_agent,
     reducer_factory=StrandsEventReducer,
-    title="strands-glue-pipeline-agent",
+    title="data-analyst-agent-strands",
     version="0.1.0",
     lifespan_resources=_lifespan_resources,
 )

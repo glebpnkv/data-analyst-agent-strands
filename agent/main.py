@@ -22,12 +22,12 @@ load_dotenv(AGENT_DIR / ".env")
 
 def parse_args() -> argparse.Namespace:
     """
-    Parse command-line arguments for the Strands Glue pipeline agent.
+    Parse command-line arguments for the Data Analyst Strands Agent.
 
     :return: argparse.Namespace object containing parsed arguments
     """
     p = argparse.ArgumentParser(
-        description="Strands Glue Pipeline Agent (Bedrock + Athena MCP + AgentCore Code Interpreter)"
+        description="Data Analyst Strands Agent (Bedrock + Athena MCP + AgentCore Code Interpreter)"
     )
     p.add_argument(
         "--profile",
@@ -72,7 +72,7 @@ def setup_observability(
     otel_endpoint: str | None = None,
 ) -> Tuple[Path, Path]:
     """
-    Setup observability infrastructure for the agent run.
+    Setup observability infrastructure for the Data Analyst Strands Agent run.
 
     :param run_dir: Base directory for logs/traces/artifacts
     :param enable_otlp: Whether to enable OTLP export
@@ -80,7 +80,7 @@ def setup_observability(
     :return: Tuple of observability directory and artifacts directory
     """
     ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-    run_root_dir = Path(run_dir) / "strands-glue-pipeline-agent" / ts
+    run_root_dir = Path(run_dir) / "data-analyst-agent-strands" / ts
     obs_dir = run_root_dir / "observability"
     artifacts_dir = run_root_dir / "artifacts"
     obs_dir.mkdir(parents=True, exist_ok=True)
@@ -174,7 +174,7 @@ def list_tools_mode() -> int:
 
 def run_agent_mode(args: argparse.Namespace) -> int:
     """
-    Run the Strands Glue pipeline agent with the specified configuration.
+    Run the Data Analyst Strands pipeline agent with the specified configuration.
 
     :param args: Command-line arguments
     :return: Exit code (0 for success)
