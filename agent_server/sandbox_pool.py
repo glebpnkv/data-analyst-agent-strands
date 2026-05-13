@@ -185,27 +185,65 @@ class SandboxPool:
         deadline = time.monotonic() + self._config.claim_timeout_s
 
         while True:
+            candidate: ClaimedTask | None = None
             async with self._lock:
                 if self._ready:
-                    task = self._ready.popleft()
-                    self._claimed.add(task.task_arn)
+                    candidate = self._ready.popleft()
                     if not self._ready:
                         self._refill_event.clear()
                     # Single-use means we always need exactly one more in
-                    # the pool to replace what we just took.
+                    # the pool to replace what we just took. We spawn the
+                    # refill here whether or not the candidate turns out
+                    # to be alive — either way it's leaving `_ready`.
                     self._spawn_refill()
+                else:
+                    # Pool is empty. If there's no in-flight refill either,
+                    # something failed; kick a fresh launch.
+                    if not self._refill_tasks:
+                        self._spawn_refill()
+                    self._refill_event.clear()
+
+            if candidate is not None:
+                # Tasks can die while sitting idle in `_ready`: the sandbox
+                # container's watchdog self-exits on idle/hard-lifetime
+                # (sandbox/server.py:_watchdog), the EC2 host can scale in,
+                # the container can OOM, etc. `_wait_for_healthz` only
+                # proves liveness at launch; without this claim-time
+                # re-probe a stale entry would be handed to the session
+                # and surface downstream as `[Errno 113] No route to host`
+                # on the first real call — after the agent has already
+                # bound the dead URL to the session.
+                if await self._probe_alive(candidate):
+                    async with self._lock:
+                        self._claimed.add(candidate.task_arn)
+                        ready_n = len(self._ready)
+                        claimed_n = len(self._claimed)
                     log.info(
                         "SandboxPool claimed %s (ready=%d, claimed=%d)",
-                        task.task_arn,
-                        len(self._ready),
-                        len(self._claimed),
+                        candidate.task_arn,
+                        ready_n,
+                        claimed_n,
                     )
-                    return task
-                # Pool is empty. If there's no in-flight refill either,
-                # something failed; kick a fresh launch.
-                if not self._refill_tasks:
-                    self._spawn_refill()
-                self._refill_event.clear()
+                    return candidate
+
+                log.warning(
+                    "SandboxPool: ready task %s failed claim-time /healthz; "
+                    "discarding and retrying",
+                    candidate.task_arn,
+                )
+                # Best-effort StopTask so a half-dead task doesn't linger
+                # on the cluster. If ECS has already reaped it, this is
+                # a harmless no-op modulo a ClientError we swallow.
+                try:
+                    await self._stop_task(
+                        candidate.task_arn,
+                        "discarded: failed claim-time healthz",
+                    )
+                except (ClientError, BotoCoreError) as e:
+                    log.debug("StopTask on discard raised: %s", e)
+                # Loop. The next iteration tries the next `_ready` entry
+                # (if any), or falls through to wait on the refill event.
+                continue
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -219,6 +257,30 @@ class SandboxPool:
                 raise TimeoutError(
                     f"no sandbox task ready within {self._config.claim_timeout_s:.0f}s"
                 ) from exc
+
+    async def _probe_alive(self, task: ClaimedTask) -> bool:
+        """Quick `/healthz` GET to confirm `task` is still answering.
+
+        Returns False on any error — connection refused, no route to host,
+        timeout, non-200 status. The caller is expected to discard the
+        task and retry. Timeout is deliberately tight: in the happy path
+        this adds a single LAN round-trip to claim(); on a dead task we
+        want to fail fast and reach for the next entry.
+
+        Broken out as a method (rather than inlined) so unit tests can
+        replace it with an AsyncMock without standing up an httpx
+        transport.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(f"{task.http_url}/healthz")
+                return r.status_code == 200
+        except Exception as e:  # noqa: BLE001
+            log.info(
+                "SandboxPool: claim-time /healthz probe of %s failed: %r",
+                task.task_arn, e,
+            )
+            return False
 
     async def release(self, task: ClaimedTask) -> None:
         """Stop the task. Single-use: never returned to the pool."""
