@@ -96,8 +96,17 @@ def _running_task_response(task_arn: str, ip: str = "10.0.1.42") -> dict:
 
 
 def _patch_healthz_noop(pool: SandboxPool) -> None:
-    """Skip the real httpx /healthz probe in unit tests."""
+    """Skip the real httpx /healthz probes in unit tests.
+
+    Two probes exist: `_wait_for_healthz` at launch (blocking until the
+    sandbox answers 200) and `_probe_alive` at claim (a cheap re-check
+    that the ready task is still answering). Both are bypassed here so
+    tests don't need a real HTTP transport. Tests that need to simulate
+    a dead-on-pop entry replace `_probe_alive` themselves after calling
+    this helper.
+    """
     pool._wait_for_healthz = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    pool._probe_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -205,6 +214,45 @@ async def test_claim_pops_a_ready_task_and_kicks_a_refill():
     # Wait for the refill triggered by claim() to complete.
     await asyncio.gather(*pool._refill_tasks, return_exceptions=True)
     assert ecs.run_task.call_count == 3, "claim() must have triggered one more RunTask"
+
+
+@pytest.mark.asyncio
+async def test_claim_discards_dead_ready_task_and_returns_the_next_one():
+    """Regression: a task can die while sitting in `_ready` (sandbox
+    watchdog idle timeout, EC2 host scale-in, OOM). Previously claim()
+    handed out the stale entry and the agent only learned it was dead
+    on the first real HTTP call — `[Errno 113] No route to host` mid
+    session. claim() now re-probes `/healthz` at pop time, discards
+    anything that fails, calls StopTask best-effort, and tries the
+    next entry."""
+    ecs = MagicMock()
+    ecs.list_tasks.return_value = {"taskArns": []}
+    arns = [f"arn-{i}" for i in range(3)]
+    ecs.run_task.side_effect = [{"tasks": [{"taskArn": a}], "failures": []} for a in arns]
+    ecs.describe_tasks.side_effect = [_running_task_response(a) for a in arns]
+
+    pool = _make_pool(pool_size=2, ecs_client=ecs)
+    _patch_healthz_noop(pool)
+
+    await pool.start()
+    await asyncio.gather(*pool._refill_tasks, return_exceptions=True)
+    assert len(pool._ready) == 2
+
+    # First ready entry is dead, second is alive. claim() must skip the
+    # dead one and return the live one.
+    pool._probe_alive = AsyncMock(side_effect=[False, True])  # type: ignore[method-assign]
+
+    claimed = await pool.claim()
+
+    # The returned task is the SECOND ready entry — the first was discarded.
+    assert claimed.task_arn == arns[1]
+    # The discarded task got a best-effort StopTask.
+    stop_reasons = [c.kwargs.get("reason", "") for c in ecs.stop_task.call_args_list]
+    assert any("claim-time healthz" in r for r in stop_reasons), (
+        f"discarded task should have been stopped with a claim-time reason; got {stop_reasons!r}"
+    )
+    # The discarded ARN must not appear in `_claimed` — only the live one.
+    assert pool._claimed == {arns[1]}
 
 
 @pytest.mark.asyncio
