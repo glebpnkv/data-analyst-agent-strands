@@ -4,6 +4,14 @@ PLAN.md
 infra/cdk.out/
 infra/cdk.context.json
 
+# Chainlit (hackathon branch) — local data-layer SQLite + uploaded files
+chainlit.db
+chainlit.db-journal
+chainlit.db-wal
+chainlit.db-shm
+.chainlit/
+.files/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

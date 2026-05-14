@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -35,6 +36,7 @@ from typing import AsyncIterator
 import boto3
 import chainlit as cl
 from botocore.exceptions import ClientError
+from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -50,6 +52,62 @@ if not BUCKET_RAW:
     raise RuntimeError("BUCKET_RAW env var is required")
 if not BUCKET_PROCESSED:
     raise RuntimeError("BUCKET_PROCESSED env var is required")
+
+# --------------------------------------------------------------------------
+# Conversation history (Chainlit data layer, SQLite-backed)
+# --------------------------------------------------------------------------
+# Persists threads / steps / elements across browser refreshes and
+# Chainlit restarts. Same `chainlit.data.sql_alchemy.SQLAlchemyDataLayer`
+# the main branch uses — only the connection string differs (sqlite +
+# aiosqlite vs Postgres). The SQLite file lives at the project root so
+# the user can easily delete it to wipe history; the path is overridable
+# via CHAINLIT_DB_PATH.
+_DB_PATH = Path(os.environ.get("CHAINLIT_DB_PATH", "./chainlit.db")).resolve()
+_SCHEMA_PATH = Path(__file__).resolve().parent / "chainlit_schema_sqlite.sql"
+
+
+def _apply_chainlit_schema() -> None:
+    """Idempotently apply the SQLite schema for Chainlit's data layer.
+
+    Run synchronously at import time — Chainlit's @cl.data_layer hook
+    fires before the first request and constructs SQLAlchemyDataLayer,
+    which expects the tables to already exist. CREATE TABLE IF NOT
+    EXISTS makes the apply a no-op on subsequent boots.
+    """
+    schema = _SCHEMA_PATH.read_text()
+    with sqlite3.connect(_DB_PATH) as conn:
+        conn.executescript(schema)
+    log.info("chainlit data-layer DB ready at %s", _DB_PATH)
+
+
+_apply_chainlit_schema()
+
+
+@cl.data_layer
+def _get_data_layer() -> SQLAlchemyDataLayer:
+    # `aiosqlite` is the async driver SQLAlchemyDataLayer needs (the
+    # data layer is async end-to-end). The path needs to be absolute
+    # so Chainlit's worker processes can find it regardless of CWD.
+    return SQLAlchemyDataLayer(conninfo=f"sqlite+aiosqlite:///{_DB_PATH}")
+
+
+# Chainlit's data layer needs a User to associate threads with — without
+# auth, threads don't persist past the in-memory session. We register a
+# header-auth callback that always identifies the visitor as "demo", so
+# the user gets zero-friction access AND the data layer has a stable
+# owner to attach threads to. CHAINLIT_AUTH_SECRET is required by
+# Chainlit's JWT signing whenever any auth callback is registered;
+# defaulted here so the demo runs out of the box, override via env for
+# anything serious.
+os.environ.setdefault(
+    "CHAINLIT_AUTH_SECRET",
+    "hackathon-demo-secret-not-for-production-use",
+)
+
+
+@cl.header_auth_callback
+def _auth(headers) -> cl.User:  # noqa: ARG001 — headers unused on purpose
+    return cl.User(identifier="demo")
 
 # Module-level boto3 clients — Chainlit reloads the module on -w which
 # remakes these. Cheap. `lam` and `iam` are used by the host-side

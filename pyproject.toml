@@ -30,6 +30,10 @@ dependencies = [
 
     # Chainlit frontend + Postgres data layer
     "chainlit>=2.11.1",
+    # Async SQLite driver — used by the hackathon-branch's SQLite-backed
+    # SQLAlchemyDataLayer (Chainlit's data layer is async end-to-end so
+    # we need an async DB driver). Tiny dep, zero config.
+    "aiosqlite>=0.20.0",
     # Pinned to match the AgentCore Code Interpreter sandbox so figure
     # JSON round-trips cleanly between sandbox-side serialise and the
     # Chainlit frontend's deserialise. Newer Plotly (>=6) drops legacy
