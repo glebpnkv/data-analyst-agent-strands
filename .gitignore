@@ -9,7 +9,13 @@ chainlit.db
 chainlit.db-journal
 chainlit.db-wal
 chainlit.db-shm
-.chainlit/
+# Ignore everything under .chainlit/ EXCEPT config.toml — the config
+# carries the sidebar's custom_css / custom_js wiring and needs to ship
+# so colleagues get the sidebar on pull. (Pattern matches contents
+# rather than the dir itself, otherwise the un-ignore can't take
+# effect — git can't re-include a file inside a fully-excluded dir.)
+.chainlit/*
+!.chainlit/config.toml
 .files/
 
 # Byte-compiled / optimized / DLL files
