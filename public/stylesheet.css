@@ -18,6 +18,10 @@ body {
   opacity: 0.8;
 }
 
+.bg-primary {
+  background-color: #00aeef !important;
+}
+
 :root {
   --stop-icon-animation: my-pulse 2s ease-in-out infinite;
   --loading-cursor-animation: my-breathe 2s ease-in-out infinite;
