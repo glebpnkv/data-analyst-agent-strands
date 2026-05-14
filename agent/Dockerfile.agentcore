@@ -2,7 +2,7 @@
 #
 # AgentCore Runtime has a fixed contract: container listens on :8080,
 # exposes POST /invocations and GET /ping. The `bedrock-agentcore` SDK's
-# `BedrockAgentCoreApp` does that for us — see agent/agentcore_app.py.
+# `BedrockAgentCoreApp` does that for us — see agent/agent.py.
 #
 # We deliberately reuse the repo's pyproject.toml / uv.lock rather than
 # trimming dependencies for this image. It pulls more than the hackathon
@@ -40,7 +40,7 @@ EXPOSE 8080
 
 ENV PYTHONPATH=/app
 
-# `python -m agent.agentcore_app` runs the BedrockAgentCoreApp.run()
-# block, which spins up a Starlette server on :8080 with /invocations
-# and /ping wired to the @entrypoint handler.
-CMD ["uv", "run", "--no-dev", "--frozen", "python", "-m", "agent.agentcore_app"]
+# `python -m agent.agent` runs the BedrockAgentCoreApp.run() block,
+# which spins up a Starlette server on :8080 with /invocations and
+# /ping wired to the @entrypoint handler.
+CMD ["uv", "run", "--no-dev", "--frozen", "python", "-m", "agent.agent"]

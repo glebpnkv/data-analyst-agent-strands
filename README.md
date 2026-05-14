@@ -62,7 +62,7 @@ Opens at <http://localhost:8000>. Use the paper-clip to attach a CSV/Excel — i
 | You changed… | Do this |
 |---|---|
 | `frontend/hackathon_app.py` | Save — Chainlit's `-w` reloads automatically. |
-| `agent/agentcore_app.py` (or anything in the container) | `uv run python scripts/hackathon_deploy.py`, wait for runtime status `READY`. |
+| `agent/agent.py` (or anything in the container) | `uv run python scripts/hackathon_deploy.py`, wait for runtime status `READY`. |
 | `pyproject.toml` (laptop deps only — e.g. plotly pin) | `uv sync`, restart Chainlit. |
 | `scripts/hackathon_bootstrap.py` (IAM, buckets) | Re-run the bootstrap script — it's idempotent and re-applies the inline policy. |
 
@@ -86,7 +86,9 @@ The pandas Lambda layer (`AWSSDKPandas-Python312`) is also blocked from cross-ac
 
 ```
 agent/
-  agentcore_app.py      — AgentCore Runtime entrypoint + tools
+  agent.py              — AgentCore Runtime entrypoint + tools
+  skills/build-pipeline/ — bronze/silver/gold pipeline workflow skill
+  skills/sandbox-artifacts/ — display-tool conventions (paths, plotly Tables)
   Dockerfile.agentcore  — container image for the runtime
 frontend/
   hackathon_app.py      — Chainlit UI + host-side Lambda deployer + image renderer

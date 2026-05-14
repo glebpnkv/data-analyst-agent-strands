@@ -6,7 +6,7 @@ between — the runtime IS the agent.
 
 Two non-trivial bits:
   - SSE handling. The runtime returns `text/event-stream` from our
-    `agentcore_app.invoke()` async generator. boto3 surfaces that as a
+    `agent.agent.invoke()` async generator. boto3 surfaces that as a
     sync `StreamingBody`, so we hop each chunk read into a thread-pool
     via `loop.run_in_executor` to keep Chainlit's event loop responsive.
   - File uploads. Chainlit attaches files as `cl.File` elements with a
@@ -198,7 +198,7 @@ PIPELINE_PENDING_PREFIX = "_pipelines/pending/"
 PIPELINE_ACTIVE_PREFIX = "_pipelines/active/"
 LAMBDA_NAME_PREFIX = "aiagent-lambda-"
 
-# Image-display rendezvous — mirrors agent/agentcore_app.py.
+# Image-display rendezvous — mirrors agent/agent.py.
 DISPLAY_PENDING_PREFIX = "_display/"
 
 # Cap on how many auto-continuation turns we'll chain after a single

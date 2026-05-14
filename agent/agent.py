@@ -1,442 +1,634 @@
+"""AgentCore Runtime entrypoint for the hackathon data-analyst-agent.
+
+Tools wired:
+  - `code_interpreter` (from strands_tools): the AgentCore Code Interpreter
+    sandbox. Persistent per AgentCore session, auto-reconnects.
+  - `list_s3_dataset` / `load_s3_into_sandbox` / `save_sandbox_to_s3`:
+    thin closures that bridge the three hackathon S3 buckets to the
+    sandbox workspace. The sandbox itself has no S3 perms — we run
+    boto3 here in the runtime container (which has the role) and push
+    bytes into the sandbox via the raw `CodeInterpreter.upload_file`
+    API, which base64-encodes binary content automatically. That keeps
+    parquet / Excel uploads working without ceremony in the LLM prompt.
+
+Streaming: SSE events forwarded as `{delta: ...}` for text and
+`{tool_use: {name, id}}` for tool invocations. Tool-use events are
+deduped by `toolUseId` so the frontend sees one badge per call,
+not one per streamed input token.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
 import os
-import sys
+import re
+import time
 import uuid
+import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 import boto3
-from mcp import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamablehttp_client
-from strands import Agent, AgentSkills
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from botocore.exceptions import ClientError
+from strands import Agent, AgentSkills, tool
 from strands.models import BedrockModel
-from strands.tools.mcp import MCPClient
+from strands_tools.code_interpreter.agent_core_code_interpreter import (
+    AgentCoreCodeInterpreter,
+)
 
-from sandbox_client import RemoteSandboxCodeInterpreter
-from utils.hooks import GlueJobRunPollThrottleHook
-from utils.prompts import SYSTEM_PROMPT
-from utils.tools import make_athena_query_to_ci_csv, make_glue_job_run_diagnostics_tool
+# Skills directory shipped alongside this module. AgentSkills exposes
+# each `<dir>/SKILL.md` to the model as a discoverable skill it can
+# read on demand — keeps the system prompt small while letting the
+# model pull in detailed playbooks (e.g. build-pipeline) when relevant.
+SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
-ALLOWED_MCP_TOOLS = [
-    "manage_aws_athena_databases_and_tables",
-    "manage_aws_athena_query_executions",
-    "manage_aws_glue_jobs",
-    "manage_aws_glue_crawlers",
-    "manage_aws_glue_triggers",
-    "manage_aws_glue_workflows",
-    "list_s3_buckets",
-    "upload_to_s3",
-    "manage_aws_athena_named_queries",
-    "manage_aws_athena_workgroups"
-]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+log = logging.getLogger(__name__)
 
-AWS_API_ALLOWED_MCP_TOOLS = [
-    "call_aws",
-]
+REGION = os.environ.get("REGION", "us-east-1")
+# `us.anthropic.*` is a cross-region inference profile, not a bare model
+# id. Sonnet 4.5 in us-east-1 only accepts inference-profile IDs — calling
+# the bare model id returns `Invocation ... with on-demand throughput isn't
+# supported`. Override via env to swap models without rebuilding.
+MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+BUCKET_RAW = os.environ.get("BUCKET_RAW", "<unset>")
+BUCKET_PROCESSED = os.environ.get("BUCKET_PROCESSED", "<unset>")
+BUCKET_GOLD = os.environ.get("BUCKET_GOLD", "<unset>")
 
-GITHUB_ALLOWED_MCP_TOOLS = [
-    "get_file_contents",
-    "list_branches",
-    "create_branch",
-    "push_files",
-    "create_pull_request",
-    # CI diagnosis (invoked on resume when the user reports CI failed):
-    "list_workflow_runs",
-    "get_workflow_run",
-    "get_workflow_run_logs",
-    "list_workflow_jobs",
-    "get_job_logs",
-]
+# Map the LLM-facing tier name to the actual bucket. Restrict writes to
+# the buckets where writing is semantically meaningful — `raw` is for
+# user uploads only, so the agent doesn't write back into it.
+_BUCKETS_BY_TIER = {
+    "raw": BUCKET_RAW,
+    "processed": BUCKET_PROCESSED,
+    "gold": BUCKET_GOLD,
+}
+_WRITABLE_TIERS = {"processed", "gold"}
 
-GITHUB_MCP_SERVER_URL = "https://api.githubcopilot.com/mcp/"
+# Lambda naming — both the runtime's IAM scope and the host-side
+# deployer in the frontend use this prefix.
+LAMBDA_NAME_PREFIX = "aiagent-lambda-"
+
+# Pipeline-spec staging area inside the processed bucket. The agent
+# CANNOT call lambda:CreateFunction or iam:CreateRole from the runtime —
+# its execution role's workshop-boundary explicitly denies iam:* and
+# only allows lambda:InvokeFunction. So `deploy_pipeline_as_lambda`
+# writes a spec under this prefix and returns; the Chainlit frontend,
+# running locally under WSParticipantRole (which DOES have those perms
+# for aiagent-lambda-*), polls this prefix after each turn and does
+# the actual CreateFunction. After deploy the spec is moved to
+# PIPELINE_ACTIVE_PREFIX so `list_pipelines` can surface what's live
+# without touching lambda:ListFunctions (also boundary-blocked).
+PIPELINE_PENDING_PREFIX = "_pipelines/pending/"
+PIPELINE_ACTIVE_PREFIX = "_pipelines/active/"
+
+# Image-display rendezvous. The agent's `display_image` tool drops a
+# PNG/SVG/etc into this prefix; the Chainlit frontend sweeps it after
+# every turn and renders each as an inline image element, then cleans
+# up. Same S3-as-IPC pattern as the pipeline deploys above.
+DISPLAY_PENDING_PREFIX = "_display/"
+_IMAGE_CONTENT_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "svg": "image/svg+xml",
+    "webp": "image/webp",
+}
+
+# Deployed pipelines have only the python3.12 stdlib + boto3 (the
+# AWS-managed pandas layer is gated by a resource policy that blocks
+# our workshop account from GetLayerVersion). Pandas work happens in
+# the AgentCore Code Interpreter sandbox; pipelines do CSV-in / CSV-out
+# with stdlib `csv` + boto3.
+
+SYSTEM_PROMPT = f"""\
+You are a data-analyst assistant for a hackathon demo. You explore
+datasets and build data pipelines end-to-end.
+
+You work with three S3 buckets in {REGION}:
+  - raw       ({BUCKET_RAW}):       pristine uploads (CSV, Excel) — never modify
+  - processed ({BUCKET_PROCESSED}): cleaned / normalised intermediates
+  - gold      ({BUCKET_GOLD}):      final curated datasets ready for analysis
+
+Tools (see each tool's docstring for usage details):
+  - `code_interpreter` — Python sandbox (pandas / numpy / matplotlib /
+    pyarrow). No direct S3 or internet — use the S3 bridge tools.
+  - `list_s3_dataset`, `load_s3_into_sandbox`, `save_sandbox_to_s3` —
+    S3 ↔ sandbox bridges.
+  - `display_image`, `display_plotly` — surface a sandbox file as an
+    inline chart/image in the chat. Saving to the sandbox alone does
+    NOT show anything; you must call one of these. Prefer plotly.
+  - `deploy_pipeline_as_lambda`, `invoke_pipeline`, `list_pipelines` —
+    pipeline lifecycle. The full workflow lives in the `build-pipeline`
+    skill — read it the moment the user mentions a pipeline / ETL /
+    transformation / bronze / silver / gold.
+"""
+
+app = BedrockAgentCoreApp()
+
+# Cache one Strands Agent per AgentCore session id so multi-turn chats
+# keep their conversation history. The Agent holds state internally;
+# we just key it by session.
+_agents: dict[str, Agent] = {}
 
 
-def _get_glue_poll_interval_seconds(default_seconds: float = 20.0) -> float:
+def _ensure_ci_client(interpreter: AgentCoreCodeInterpreter):
+    """Return the raw CI client for the interpreter's default session,
+    initialising the session if it hasn't been used yet.
+
+    The Strands wrapper lazily creates an AgentCore CI session on first
+    `code_interpreter` tool call from the LLM. Our S3 bridge tools need
+    the underlying client (for binary-safe `upload_file`) and may be
+    invoked before the LLM has touched the sandbox, so we trigger the
+    same lazy-init path explicitly via the wrapper's `_ensure_session`
+    helper. Single-underscore protected method, but it IS the canonical
+    "make sure this session exists" entry point in this SDK.
     """
-    Resolve minimum poll interval for repeated Glue get-job-run calls.
-
-    Reads `GLUE_GET_JOB_RUN_MIN_INTERVAL_SECONDS` from environment and falls back
-    to `default_seconds` when unset or invalid.
-
-    :param default_seconds: Default minimum interval in seconds
-    :return: Non-negative interval in seconds
-    """
-    raw_value = (os.getenv("GLUE_GET_JOB_RUN_MIN_INTERVAL_SECONDS") or "").strip()
-    if not raw_value:
-        return max(0.0, default_seconds)
-
-    try:
-        return max(0.0, float(raw_value))
-    except ValueError:
-        return max(0.0, default_seconds)
+    interpreter._ensure_session(interpreter.default_session)
+    return interpreter._sessions[interpreter.default_session].client
 
 
-def _resolve_mcp_server_command() -> tuple[str, list[str]]:
-    """
-    Resolve how to launch the AWS data processing MCP server.
-
-    Prefer the installed Python module for reproducible runtime deploys.
-    Fall back to `uvx` when the package is not installed.
-    """
-    try:
-        import awslabs.aws_dataprocessing_mcp_server.server  # noqa: F401
-
-        return (
-            sys.executable,
-            [
-                "-m",
-                "awslabs.aws_dataprocessing_mcp_server.server",
-                "--allow-write",
-                "--allow-sensitive-data-access",
-            ],
-        )
-    except Exception:
-        return (
-            "uvx",
-            [
-                "awslabs.aws-dataprocessing-mcp-server@latest",
-                "--allow-write",
-                "--allow-sensitive-data-access",
-            ],
-        )
-
-def _resolve_api_mcp_server_command() -> tuple[str, list[str]]:
-    try:
-        import awslabs.aws_api_mcp_server.server  # noqa: F401
-
-        return (
-            sys.executable,
-            [
-                "-m",
-                "awslabs.aws_api_mcp_server.server",
-            ],
-        )
-    except Exception:
-        return (
-            "uvx",
-            [
-                "awslabs.aws-api-mcp-server@latest",
-            ],
-        )
-
-
-def _build_mcp_env(profile: Optional[str], region: Optional[str]) -> dict[str, str]:
-    """
-    Build subprocess environment for the AWS MCP server.
-
-    Local dev (no ECS task metadata env): also propagates
-    AWS_SDK_LOAD_CONFIG=1 + AWS_EC2_METADATA_DISABLED=true onto the
-    parent's os.environ. AWS_SDK_LOAD_CONFIG=1 lets boto3 resolve SSO
-    credentials from `~/.aws/config`; without it some users' agents
-    couldn't find their `aws sso login` session. AWS_EC2_METADATA_DISABLED=true
-    avoids a multi-second IMDS lookup delay outside EC2.
-
-    Container (ECS task metadata env present): we DO NOT mutate
-    os.environ. AWS_SDK_LOAD_CONFIG=1 in a Fargate container with no
-    `~/.aws/config` makes any boto3 call that touches scoped config
-    fail with `ProfileNotFound: default`. Inside the container, the
-    task role + ECS container credential provider are how boto3 gets
-    credentials, no profile or config file involved.
-
-    The subprocess env (returned dict) gets the same AWS_* settings in
-    both cases — the MCP server is its own Python process and benefits
-    from the same SSO-friendly behavior locally; in the container
-    they're harmless because the subprocess inherits the same
-    credential chain as the parent.
-    """
-    in_ecs = bool(
-        os.environ.get("ECS_CONTAINER_METADATA_URI")
-        or os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
-    )
-    if not in_ecs:
-        os.environ.setdefault("AWS_SDK_LOAD_CONFIG", "1")
-        os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
-        os.environ.setdefault("AWS_STS_REGIONAL_ENDPOINTS", "regional")
-
-    env = dict(os.environ)  # preserves PATH/HOME/etc.
-    env.setdefault("AWS_SDK_LOAD_CONFIG", "1")
-    env.setdefault("AWS_EC2_METADATA_DISABLED", "true")
-    env.setdefault("AWS_STS_REGIONAL_ENDPOINTS", "regional")
-    env["FASTMCP_LOG_LEVEL"] = "INFO"
-    if profile:
-        env["AWS_PROFILE"] = profile
-    if region:
-        env["AWS_REGION"] = region
-        env["AWS_DEFAULT_REGION"] = region
-    return env
-
-
-def make_mcp_client(allowed_tools: Optional[list[str]] = None) -> MCPClient:
-    """
-    Create an MCP client configured for Athena/Glue operations.
-
-    :param allowed_tools: Optional override for allowed tool names
-    :return: MCPClient instance
-    """
-    profile = os.environ.get("AWS_PROFILE")
-    region = os.environ.get("AWS_REGION")
-    env = _build_mcp_env(profile=profile, region=region)
-    server_command, server_args = _resolve_mcp_server_command()
-
-    return MCPClient(
-        lambda: stdio_client(
-            StdioServerParameters(
-                command=server_command,
-                args=server_args,
-                env=env,
-            )
-        ),
-        tool_filters={"allowed": allowed_tools or ALLOWED_MCP_TOOLS},
-        prefix="athena",
-    )
-
-def make_aws_api_mcp_client() -> MCPClient:
-    profile = os.environ.get("AWS_PROFILE")
-    region = os.environ.get("AWS_REGION")
-    env = _build_mcp_env(profile=profile, region=region)
-
-    # AWS API MCP prefers its own profile env var.
-    if profile:
-        env["AWS_API_MCP_PROFILE_NAME"] = profile
-    if region:
-        env["AWS_REGION"] = region
-
-    server_command, server_args = _resolve_api_mcp_server_command()
-
-    return MCPClient(
-        lambda: stdio_client(
-            StdioServerParameters(
-                command=server_command,
-                args=server_args,
-                env=env,
-            )
-        ),
-        tool_filters={"allowed": AWS_API_ALLOWED_MCP_TOOLS},
-        prefix="awsapi",
-    )
-
-def make_github_mcp_client() -> MCPClient:
-    """
-    Create an MCP client for GitHub's official remote MCP server.
-
-    Uses the hosted `https://api.githubcopilot.com/mcp/` endpoint over
-    streamable HTTP. Auth is a fine-grained PAT from `GITHUB_PAT`, passed
-    as a bearer token. Repo pinning is enforced both by PAT scope and by
-    the rules in `_build_git_rules()`.
-    """
-    pat = os.environ.get("GITHUB_PAT", "").strip()
-    if not pat:
-        raise RuntimeError("GITHUB_PAT env var is required for the GitHub MCP client")
-
-    headers = {"Authorization": f"Bearer {pat}"}
-
-    return MCPClient(
-        lambda: streamablehttp_client(
-            url=GITHUB_MCP_SERVER_URL,
-            headers=headers,
-        ),
-        tool_filters={"allowed": GITHUB_ALLOWED_MCP_TOOLS},
-        prefix="github",
-    )
-
-
-def _build_runtime_glue_rules() -> str:
-    """
-    Build runtime-focused Glue rules appended to system prompt.
-
-    :return: Runtime-specific prompt section
-    """
-    role_text = os.getenv("GLUE_JOB_ROLE_ARN", "") or "(not configured; ask user for role ARN)"
-    scheduler_role_text = os.getenv("SCHEDULER_ATHENA_EXEC_ROLE_ARN", "") or "(not configured; ask user for scheduler role ARN or create one)"
-    # TODO: move from static default script object to conversation-scoped script paths:
-    # s3://glue-assets-554032904022-eu-central-1-an/strands-glue-pipeline-agent/scripts/<conversation_id>/<script_name>.py
-    script_text = os.getenv("GLUE_JOB_DEFAULT_SCRIPT_S3", "") or "(not configured; ask user for script S3 URI)"
-    temp_dir_text = os.getenv("GLUE_TEMP_DIR", "") or "(not configured)"
-    poll_interval_seconds = _get_glue_poll_interval_seconds(default_seconds=20.0)
-    return (
-        "RUNTIME GLUE RULES:\n"
-        "- When GLUE_JOB_ROLE_ARN is configured, always set `job_definition.Role` to that exact ARN.\n"
-        "- Do not use AWSGlueServiceRole-default unless the user explicitly asks for it.\n"
-        "- When role/script/temp are not provided by user, use these defaults:\n"
-        f"  - Role ARN default: {role_text}\n"
-        f"  - Scheduler Athena execution role default: {scheduler_role_text}\n"
-        f"  - ScriptLocation default: {script_text}\n"
-        f"  - --TempDir default: {temp_dir_text}\n"
-        "- For EventBridge Scheduler + Athena SQL schedules:\n"
-        "- If SCHEDULER_ATHENA_EXEC_ROLE_ARN is configured, always set Scheduler Target.RoleArn to that exact ARN.\n"
-        "- Do not create ad-hoc scheduler execution roles when SCHEDULER_ATHENA_EXEC_ROLE_ARN is configured.\n"
-        "- If no scheduler role is configured and schedule creation is requested, create one trusted by scheduler.amazonaws.com with Athena + Glue catalog + S3 runtime permissions; include both glue:GetPartition and glue:GetPartitions.\n"
-        "- For crawler-based conditional triggers:\n"
-        "  - ensure crawler exists first (via `athena_manage_aws_glue_crawlers`),\n"
-        "  - in predicate conditions use `CrawlerName` with `CrawlState`, not `State`.\n"
-        "- Completion precondition for any created/updated job:\n"
-        "  - run `athena_manage_aws_glue_jobs(operation='start-job-run', ...)`,\n"
-        f"  - poll `athena_manage_aws_glue_jobs(operation='get-job-run', ...)` once every {poll_interval_seconds:g} seconds until terminal state,\n"
-        "  - only mark success if state is `SUCCEEDED`;\n"
-        "  - if state is `FAILED`/`TIMEOUT`, call `glue_get_job_run_diagnostics` and include root-cause log lines.\n"
-        "- If `update-job` fails due MCP-managed resource constraints, explain it and propose create-new-job fallback.\n"
-        "- For schedule/cron output, always state timezone explicitly as UTC.\n"
-        f"- Runtime guardrail: repeated `get-job-run` calls for the same `(job_name, job_run_id)` are throttled to at least {poll_interval_seconds:g}s.\n"
-    )
-
-
-def _build_git_rules() -> str:
-    """
-    Build GitHub workflow rules appended to the system prompt.
-
-    Pins every GitHub call to the single configured repo, defines the
-    scratch -> push -> wait -> production -> PR lifecycle, and forbids
-    destructive operations.
-    """
-    owner = os.getenv("TARGET_REPO_OWNER", "").strip()
-    repo = os.getenv("TARGET_REPO_NAME", "").strip()
-    default_branch = os.getenv("TARGET_REPO_DEFAULT_BRANCH", "").strip() or "main"
-    repo_text = f"{owner}/{repo}" if owner and repo else "(not configured; ask user for target owner/repo)"
-    return (
-        "GITHUB WORKFLOW RULES:\n"
-        "- NON-NEGOTIABLE: when the user asks for a Glue Python Shell job, Phase A is NOT complete without a pushed feature branch. A successful scratch run alone is NOT the deliverable — the deliverable is (scratch SUCCEEDED) + (production code laid out per `project-structure`) + (branch created) + (files pushed). If you plan, run, and stop without the git steps, you have failed the task. Do not summarise Phase A as done until `github_push_files` has returned successfully.\n"
-        f"- The target repo `{repo_text}` lives on GitHub. For ALL repo operations (branches, files, commits, PRs) use the `github_*` MCP tools. NEVER use `awsapi_call_aws` — there is no AWS CodeCommit involved.\n"
-        f"- Every GitHub tool call MUST target `{repo_text}` exactly. Never a different owner or repo.\n"
-        f"- Default branch: `{default_branch}`. Never commit directly to it. Never force-push. Never delete branches.\n"
-        "- Feature branch naming: `agent/<short-conversation-slug>`. Call `github_list_branches` first to confirm the branch does not already exist; if it does, pick a new suffix.\n"
-        "- Division of responsibilities: the agent creates Glue jobs ONLY in Phase A (scratch). In Phase B, the target repo's `deploy/deploy.py` (invoked by GitHub Actions) creates and updates Glue jobs from `glue-jobs.yaml`. Do NOT call `create-job` or `update-job` in Phase B.\n"
-        "- Full lifecycle (do not skip or reorder phases):\n"
-        "  PHASE A — scratch + commit:\n"
-        "    A.1. Iterate on the job logic using a loose-script Glue job in the dev AWS account. The scratch Glue job name MUST be prefixed `scratch-<conversation-id>-`. Iterate until the scratch run reaches `SUCCEEDED`.\n"
-        "    A.2. Activate the `project-structure` skill. Lay out the production code per its rules (including `pyproject.toml` dependency declarations), add/update the job's entry in `glue-jobs.yaml`, then `github_list_branches` -> `github_create_branch` from the default branch -> `github_push_files` in a single batch.\n"
-        "    A.3. END THE TURN. Tell the user the feature branch has been pushed and ask them to resume once the GitHub Actions pipeline (`test` -> `build-wheels` -> `deploy`) has gone green. Do NOT poll or wait.\n"
-        "  PHASE B — verify + PR (on resume):\n"
-        "    B.1. Verify CI is green: `github_list_workflow_runs` filtered by the feature branch -> `github_get_workflow_run` for the latest run. If conclusion is not `success`, call `github_list_workflow_jobs` + `github_get_job_logs` for the failed job, surface the root-cause log lines, and stop. Do NOT touch the Glue job.\n"
-        "    B.2. Look up the Glue job by the name in `glue-jobs.yaml` (it exists because `deploy.py` created or updated it). Run one `start-job-run`, poll `get-job-run` via `athena_manage_aws_glue_jobs` (NOT via `awsapi_call_aws` — the poll throttle only guards the MCP path), and proceed only if `SUCCEEDED`. If the job is missing, CI has not deployed yet — tell the user and stop. If the Glue run fails, call `glue_get_job_run_diagnostics`, surface the logs, and stop; do NOT open the PR.\n"
-        "    B.3. `github_create_pull_request` against the default branch with a descriptive title and body summarising what the job does, the Glue job name, the job run ID, and a link to the green CI run. End the turn. Do NOT watch for merge.\n"
-        "- Forbidden: force-push, branch deletion, direct commits to the default branch, opening a PR before Phase B's verification run has passed, creating or updating Glue jobs via MCP during Phase B.\n"
-    )
-
-
-def _build_ci_handoff_rules(ci_session_name: str) -> str:
-    """
-    Build code-interpreter handoff rules appended to system prompt.
-
-    :param ci_session_name: Code interpreter session identifier
-    :return: Prompt section for Athena-to-CI handoff
-    """
-    return (
-        "IMPORTANT DATA HANDOFF RULES:\n"
-        "- Never manually transcribe tabular rows from tool text into Python lists/dicts.\n"
-        "- For Athena data that will be analyzed in code interpreter, first call athena_query_to_ci_csv.\n"
-        "- Always pass `database` explicitly when calling athena_query_to_ci_csv.\n"
-        "- Then use the code_interpreter tool to read the returned CSV path from the sandbox.\n"
-        + f"- The code interpreter session name for this run is: {ci_session_name}\n"
-    )
-
-
-def _create_skills_plugin(skills_dir: Path):
-    """
-    Create a Strands AgentSkills plugin from local skill files.
-
-    Args:
-        skills_dir: Directory containing skills (each child has `SKILL.md`).
-
-    Returns:
-        AgentSkills plugin instance, or `None` when the directory is missing.
-    """
-    if not skills_dir.exists():
-        return None
-    return AgentSkills(skills=str(skills_dir))
-
-
-def make_agent(
-    profile: Optional[str],
-    region: str,
-    model_id: str,
-    mcp_client: MCPClient,
-    sandbox_http_url: Optional[str] = None,
-    sandbox_auth_token: Optional[str] = None,
-) -> tuple[Agent, Optional[str], Optional[RemoteSandboxCodeInterpreter]]:
-    """
-    Create the Strands Glue pipeline agent.
-
-    Used by both local CLI mode and the FastAPI runtime. The code
-    interpreter is attached only when both `sandbox_http_url` and
-    `sandbox_auth_token` are provided — leaving them None gives a
-    degraded agent (no CI, no Athena→CSV handoff). The pool /
-    local-URL decision lives in the caller (agent/server/main.py),
-    not here.
-
-    :param profile: AWS profile name
-    :param region: AWS region
-    :param model_id: Bedrock model ID
-    :param mcp_client: MCP client wrapper for Athena/Glue tools
-    :param sandbox_http_url: Base URL of a sandbox task (e.g. `http://10.0.1.42:8081`),
-        or None to skip attaching a code interpreter.
-    :param sandbox_auth_token: Shared-secret token the sandbox expects in
-        `X-Sandbox-Auth`. Required iff `sandbox_http_url` is set.
-    :return: Agent, optional CI session name, optional code interpreter tool
-    """
-    session = boto3.Session(profile_name=profile, region_name=region)
-    model = BedrockModel(
-        boto_session=session,
-        model_id=model_id,
-    )
-
-    aws_api_mcp_client = make_aws_api_mcp_client()
-    github_mcp_client = make_github_mcp_client()
-
-    tools = [mcp_client, aws_api_mcp_client, github_mcp_client]
-    prompt_parts = [SYSTEM_PROMPT]
-    poll_interval_seconds = _get_glue_poll_interval_seconds(default_seconds=20.0)
-    hooks = [GlueJobRunPollThrottleHook(min_interval_seconds=poll_interval_seconds)]
-    skills_dir = Path(__file__).resolve().parent / "skills"
-    skills_plugin = _create_skills_plugin(skills_dir)
-    ci_session_name: Optional[str] = None
-    code_interpreter_tool: Optional[RemoteSandboxCodeInterpreter] = None
-
-    # Always include Glue runtime rules so both local CLI and the FastAPI
-    # runtime enforce the same job/role/trigger behavior.
-    prompt_parts.append(_build_runtime_glue_rules())
-    prompt_parts.append(_build_git_rules())
-
-    if sandbox_http_url and sandbox_auth_token:
-        # Per-call session name purely for log correlation; the kernel is
-        # one-per-task so the name doesn't gate state isolation.
-        ci_session_name = f"glue-pipeline-{uuid.uuid4().hex[:10]}"
-        code_interpreter_tool = RemoteSandboxCodeInterpreter(
-            http_url=sandbox_http_url,
-            auth_token=sandbox_auth_token,
-            session_name=ci_session_name,
-        )
-
-        athena_query_to_ci_csv = make_athena_query_to_ci_csv(
-            session=session,
-            region=region,
-            code_interpreter_tool=code_interpreter_tool,
-            ci_session_name=ci_session_name,
-        )
-
-        tools.extend([athena_query_to_ci_csv, code_interpreter_tool.code_interpreter])
-        prompt_parts.append(_build_ci_handoff_rules(ci_session_name=ci_session_name))
-    elif sandbox_http_url or sandbox_auth_token:
-        # Either both or neither — half-set is almost always a misconfig.
+def _resolve_tier(tier: str, writable: bool = False) -> str:
+    """LLM-facing tier name → bucket name. Raises if unknown or unwritable."""
+    tier_clean = (tier or "").strip().lower()
+    if tier_clean not in _BUCKETS_BY_TIER:
         raise ValueError(
-            "sandbox_http_url and sandbox_auth_token must be set together "
-            "(or both omitted to disable the code interpreter)."
+            f"unknown tier {tier!r}; expected one of {sorted(_BUCKETS_BY_TIER)}"
+        )
+    if writable and tier_clean not in _WRITABLE_TIERS:
+        raise ValueError(
+            f"tier {tier_clean!r} is read-only; writable tiers are {sorted(_WRITABLE_TIERS)}"
+        )
+    return _BUCKETS_BY_TIER[tier_clean]
+
+
+def _build_agent(session_id: str) -> Agent:
+    """Build a Strands Agent with code-interpreter + S3 + Lambda tools."""
+    model = BedrockModel(model_id=MODEL_ID, region_name=REGION)
+    interpreter = AgentCoreCodeInterpreter(
+        region=REGION,
+        session_name=session_id,
+    )
+    # boto3 clients created once per agent so all tool calls share the
+    # same connection pool. AgentCore Runtime resolves creds from the
+    # task role automatically — no profile needed inside the container.
+    # Only `s3` and `lambda` are used here: workshop-boundary denies
+    # iam:* and all lambda actions other than InvokeFunction, so the
+    # deploy step has to be done by the Chainlit host (see the
+    # pipeline_pending prefix in the processed bucket).
+    s3 = boto3.client("s3", region_name=REGION)
+    lam = boto3.client("lambda", region_name=REGION)
+
+    @tool
+    def list_s3_dataset(tier: str, prefix: str = "") -> dict[str, Any]:
+        """List objects in one of the three data buckets.
+
+        Use this to discover available datasets before loading them
+        into the sandbox.
+
+        Args:
+            tier: One of "raw", "processed", "gold".
+            prefix: Optional key prefix to narrow the listing.
+
+        Returns:
+            A dict with `bucket`, `tier`, and `objects` (a list of
+            `{key, size, last_modified}` items).
+        """
+        bucket = _resolve_tier(tier)
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        return {
+            "tier": tier,
+            "bucket": bucket,
+            "objects": [
+                {
+                    "key": obj["Key"],
+                    "size": obj["Size"],
+                    "last_modified": obj["LastModified"].isoformat(),
+                }
+                for obj in resp.get("Contents", [])
+            ],
+        }
+
+    @tool
+    def load_s3_into_sandbox(
+        tier: str, key: str, local_filename: str | None = None
+    ) -> dict[str, Any]:
+        """Copy an S3 object into the code-interpreter sandbox workspace.
+
+        Binary-safe — parquet, Excel, and CSV all work. The file is
+        placed at the workspace root unless `local_filename` includes
+        subdirectories. After this returns, the sandbox can read the
+        file with normal pandas calls, e.g. `pd.read_parquet(path)`.
+
+        Args:
+            tier: One of "raw", "processed", "gold".
+            key: The S3 object key (e.g. "demo/sales.parquet").
+            local_filename: Optional override for the sandbox filename;
+                defaults to the basename of `key`.
+
+        Returns:
+            A dict with `workspace_path`, `size_bytes`, and `source_s3_uri`.
+        """
+        bucket = _resolve_tier(tier)
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        filename = local_filename or key.rsplit("/", 1)[-1]
+        client = _ensure_ci_client(interpreter)
+        # Sniff: if the bytes are valid UTF-8 we ship them as `text` —
+        # the sandbox writes the file as plain text and pandas can read
+        # it directly with `pd.read_csv(...)`. If decoding fails it's
+        # genuinely binary (parquet, Excel, image) and we send bytes,
+        # which the CI client base64-encodes into the `blob` field. The
+        # CI service decodes the blob on landing, so the file in the
+        # workspace is the correct binary either way.
+        try:
+            content: bytes | str = body.decode("utf-8")
+        except UnicodeDecodeError:
+            content = body
+        client.upload_file(path=filename, content=content)
+        return {
+            "workspace_path": filename,
+            "size_bytes": len(body),
+            "source_s3_uri": f"s3://{bucket}/{key}",
+            "uploaded_as": "text" if isinstance(content, str) else "binary",
+        }
+
+    def _stage_display(
+        kind: str,
+        workspace_path: str,
+        caption: str,
+        content_type_default: str,
+    ) -> dict[str, Any]:
+        """Shared body for the display_* tools.
+
+        Both display_image and display_plotly land in the same S3
+        rendezvous — they only differ in the `type` field on the
+        manifest, which the Chainlit dispatcher uses to pick the right
+        Chainlit element class (cl.Image vs cl.Plotly).
+        """
+        client = _ensure_ci_client(interpreter)
+        content = client.download_file(workspace_path)
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        filename = workspace_path.rsplit("/", 1)[-1] or f"{kind}.bin"
+        if kind == "image":
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            content_type = _IMAGE_CONTENT_TYPES.get(ext, content_type_default)
+        else:
+            content_type = content_type_default
+        display_id = uuid.uuid4().hex[:12]
+        payload_key = f"{DISPLAY_PENDING_PREFIX}{display_id}/{filename}"
+        meta_key = f"{DISPLAY_PENDING_PREFIX}{display_id}/meta.json"
+        s3.put_object(
+            Bucket=BUCKET_PROCESSED,
+            Key=payload_key,
+            Body=content,
+            ContentType=content_type,
+        )
+        s3.put_object(
+            Bucket=BUCKET_PROCESSED,
+            Key=meta_key,
+            Body=json.dumps(
+                {
+                    "type": kind,           # "image" | "plotly"
+                    "payload_key": payload_key,
+                    "filename": filename,
+                    "caption": caption,
+                    "content_type": content_type,
+                    "queued_at": int(time.time()),
+                },
+                indent=2,
+            ).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return {
+            "display_s3_uri": f"s3://{BUCKET_PROCESSED}/{payload_key}",
+            "kind": kind,
+            "status": "queued",
+            "note": "The frontend will render this in the chat shortly.",
+        }
+
+    @tool
+    def display_image(workspace_path: str, caption: str = "") -> dict[str, Any]:
+        """Show a STATIC image (PNG / JPG / SVG) in the chat.
+
+        Call after `plt.savefig('plots/distribution.png')` or similar.
+        For interactive Plotly charts, use `display_plotly` instead —
+        it gives the user hover / zoom / pan.
+
+        Args:
+            workspace_path: Sandbox path to the image file.
+            caption: Optional one-line caption shown below the image.
+
+        Returns:
+            Dict with `display_s3_uri` and `status: queued`.
+        """
+        return _stage_display(
+            kind="image",
+            workspace_path=workspace_path,
+            caption=caption,
+            content_type_default="application/octet-stream",
         )
 
-    # Available in both local and runtime modes for failed-run debugging.
-    glue_job_run_diagnostics = make_glue_job_run_diagnostics_tool(
-        session=session,
-        region=region,
+    @tool
+    def display_plotly(workspace_path: str, caption: str = "") -> dict[str, Any]:
+        """Show an INTERACTIVE Plotly chart in the chat.
+
+        First save the figure as JSON inside the sandbox, e.g.
+            fig.write_json('plots/chart.json')
+        or
+            with open('plots/chart.json', 'w') as f:
+                f.write(fig.to_json())
+        then call this with the path. The frontend deserialises it back
+        into a `plotly.graph_objects.Figure` and renders it via
+        `cl.Plotly`, so the user gets the standard Plotly toolbar.
+
+        Args:
+            workspace_path: Sandbox path to the figure JSON file.
+            caption: Optional one-line caption shown below the chart.
+
+        Returns:
+            Dict with `display_s3_uri` and `status: queued`.
+        """
+        return _stage_display(
+            kind="plotly",
+            workspace_path=workspace_path,
+            caption=caption,
+            content_type_default="application/json",
+        )
+
+    @tool
+    def save_sandbox_to_s3(
+        local_filename: str, tier: str, key: str
+    ) -> dict[str, Any]:
+        """Upload a sandbox-workspace file to S3.
+
+        Only `processed` and `gold` are writable. Use this after the
+        sandbox has produced a transformed dataset, plot, or report.
+
+        Args:
+            local_filename: Path to the file inside the sandbox workspace
+                (e.g. "summary.parquet" or "plots/distribution.png").
+            tier: One of "processed", "gold".
+            key: Destination S3 object key.
+
+        Returns:
+            A dict with `s3_uri` and `size_bytes`.
+        """
+        bucket = _resolve_tier(tier, writable=True)
+        client = _ensure_ci_client(interpreter)
+        # download_file on the raw CI client returns bytes for binary.
+        result = client.download_file(path=local_filename)
+        content = result.get("content")
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        s3.put_object(Bucket=bucket, Key=key, Body=content)
+        return {
+            "s3_uri": f"s3://{bucket}/{key}",
+            "size_bytes": len(content),
+        }
+
+    # ---- Lambda-as-pipeline tools ----------------------------------------
+
+    def _sanitise_pipeline_name(name: str) -> str:
+        """LLM-supplied name → a Lambda/IAM-safe suffix.
+
+        Both Lambda function names and IAM role names accept only
+        `[a-zA-Z0-9_-]`. We keep at most 32 chars after the prefix so
+        the full `aiagent-lambda-...` name stays inside the 64-char
+        Lambda function-name limit and the 64-char IAM role-name limit.
+        """
+        cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_-")[:32]
+        if not cleaned:
+            raise ValueError(f"pipeline name {name!r} sanitises to empty")
+        return cleaned
+
+    @tool
+    def deploy_pipeline_as_lambda(
+        name: str, code: str, description: str = ""
+    ) -> dict[str, Any]:
+        """Queue a Python pipeline for deployment as an AWS Lambda function.
+
+        The code MUST define `def handler(event, context):` — that's the
+        Lambda entrypoint. The deployed Lambda has ONLY the python3.12
+        stdlib + boto3 available (no pandas / numpy). Use the `csv`
+        module for CSV-in / CSV-out work. Bucket names are exposed
+        inside the handler as env vars: BUCKET_RAW, BUCKET_PROCESSED,
+        BUCKET_GOLD.
+
+        IMPORTANT — how deployment actually happens: this tool does NOT
+        call lambda:CreateFunction itself. The agent's execution role
+        on this account is capped by a permissions boundary that
+        forbids lambda creation and ALL IAM actions. Instead, this
+        tool writes the pipeline spec (handler code + metadata) into
+        the processed bucket under `_pipelines/pending/<name>/`, and
+        the Chainlit frontend (running locally under a less restricted
+        role) deploys it within seconds of the agent's turn ending.
+
+        Tell the user something like "I've queued the pipeline; the
+        frontend will deploy it now" — they'll see a confirmation
+        message appear in the chat once the deploy completes.
+
+        Args:
+            name: Short pipeline name. Will be sanitised and prefixed
+                with `aiagent-lambda-`.
+            code: Python source. Must define `def handler(event, context)`.
+            description: Optional human-readable description.
+
+        Returns:
+            Dict with the sanitised function name, the spec S3 URI,
+            and a `status` of "queued" — the host-side deployer
+            takes over from there.
+        """
+        suffix = _sanitise_pipeline_name(name)
+        function_name = f"{LAMBDA_NAME_PREFIX}{suffix}"
+
+        # Write the spec atomically by uploading the bigger blob (the
+        # zip) first and the small JSON manifest last — the host-side
+        # deployer triggers off the manifest, so seeing it means the
+        # zip is already there.
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("handler.py", code)
+        zip_bytes = zip_buf.getvalue()
+
+        zip_key = f"{PIPELINE_PENDING_PREFIX}{suffix}/handler.zip"
+        manifest_key = f"{PIPELINE_PENDING_PREFIX}{suffix}/manifest.json"
+        manifest = {
+            "function_name": function_name,
+            "suffix": suffix,
+            "description": description or f"Hackathon pipeline {suffix}",
+            "zip_s3_uri": f"s3://{BUCKET_PROCESSED}/{zip_key}",
+            "queued_at": int(time.time()),
+            # Bucket env vars the host-side deployer should bake into
+            # the function's Environment.Variables.
+            "env_vars": {
+                "BUCKET_RAW": BUCKET_RAW,
+                "BUCKET_PROCESSED": BUCKET_PROCESSED,
+                "BUCKET_GOLD": BUCKET_GOLD,
+            },
+        }
+        s3.put_object(Bucket=BUCKET_PROCESSED, Key=zip_key, Body=zip_bytes)
+        s3.put_object(
+            Bucket=BUCKET_PROCESSED,
+            Key=manifest_key,
+            Body=json.dumps(manifest, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(
+            "queued pipeline %s (%d bytes zip, manifest=s3://%s/%s)",
+            function_name, len(zip_bytes), BUCKET_PROCESSED, manifest_key,
+        )
+        return {
+            "function_name": function_name,
+            "manifest_s3_uri": f"s3://{BUCKET_PROCESSED}/{manifest_key}",
+            "status": "queued",
+            "note": (
+                "The Chainlit frontend deploys queued pipelines after each "
+                "turn. The user will see a confirmation message in the "
+                "chat once the function is live."
+            ),
+        }
+
+    @tool
+    def invoke_pipeline(name: str, payload: dict | None = None) -> dict[str, Any]:
+        """Invoke a deployed pipeline once (synchronous) and return its response.
+
+        Use this to prove the pipeline runs end-to-end after deploy.
+        Args:
+            name: The pipeline name (sanitised, with or without the
+                `aiagent-lambda-` prefix).
+            payload: Optional event dict passed to the handler. Defaults
+                to an empty event.
+
+        Returns:
+            Dict with `status_code`, `payload` (parsed JSON if possible
+            else raw string), and `log_tail` (last 4KB of execution logs).
+        """
+        suffix = _sanitise_pipeline_name(name).removeprefix(LAMBDA_NAME_PREFIX)
+        function_name = f"{LAMBDA_NAME_PREFIX}{suffix}"
+        body = json.dumps(payload or {}).encode("utf-8")
+        resp = lam.invoke(
+            FunctionName=function_name,
+            InvocationType="RequestResponse",
+            LogType="Tail",
+            Payload=body,
+        )
+        raw = resp["Payload"].read().decode("utf-8", errors="replace")
+        try:
+            parsed: Any = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = raw
+        # Tail comes back base64'd. Decode for the LLM's benefit.
+        import base64
+        log_tail_b64 = resp.get("LogResult", "")
+        log_tail = base64.b64decode(log_tail_b64).decode("utf-8", errors="replace")
+        return {
+            "status_code": resp["StatusCode"],
+            "function_error": resp.get("FunctionError"),
+            "payload": parsed,
+            "log_tail": log_tail,
+        }
+
+    @tool
+    def list_pipelines() -> dict[str, Any]:
+        """List pipelines deployed in this account.
+
+        Note: the runtime can't call lambda:ListFunctions (boundary-
+        blocked), so this reads the active-pipelines manifest the
+        Chainlit host writes when it completes a deploy. Each entry
+        is a JSON manifest under `_pipelines/active/<suffix>/manifest.json`
+        in the processed bucket. Reflects what's actually live.
+        """
+        out = []
+        resp = s3.list_objects_v2(
+            Bucket=BUCKET_PROCESSED, Prefix=PIPELINE_ACTIVE_PREFIX
+        )
+        for obj in resp.get("Contents", []):
+            if not obj["Key"].endswith("/manifest.json"):
+                continue
+            body = s3.get_object(Bucket=BUCKET_PROCESSED, Key=obj["Key"])["Body"].read()
+            try:
+                out.append(json.loads(body.decode("utf-8")))
+            except json.JSONDecodeError:
+                pass
+        return {"pipelines": out, "count": len(out)}
+
+    # Pull in `agent/skills/*/SKILL.md` as a discoverable plugin. The
+    # model can read these on-demand (kept out of the always-on system
+    # prompt to keep tokens lean) — `build-pipeline` is the headline
+    # one for this branch but everything in the dir gets exposed.
+    agent_kwargs: dict[str, Any] = dict(
+        model=model,
+        system_prompt=SYSTEM_PROMPT,
+        tools=[
+            interpreter.code_interpreter,
+            list_s3_dataset,
+            load_s3_into_sandbox,
+            save_sandbox_to_s3,
+            display_image,
+            display_plotly,
+            deploy_pipeline_as_lambda,
+            invoke_pipeline,
+            list_pipelines,
+        ],
     )
-    tools.append(glue_job_run_diagnostics)
+    if SKILLS_DIR.exists():
+        agent_kwargs["plugins"] = [AgentSkills(skills=str(SKILLS_DIR))]
+    return Agent(**agent_kwargs)
 
-    agent_kwargs = {
-        "model": model,
-        "tools": tools,
-        "system_prompt": "\n\n".join(prompt_parts),
-        "hooks": hooks,
-    }
-    if skills_plugin is not None:
-        agent_kwargs["plugins"] = [skills_plugin]
 
-    agent = Agent(**agent_kwargs)
+def _get_agent(session_id: str) -> Agent:
+    if session_id not in _agents:
+        log.info("building agent for session %s (model=%s)", session_id, MODEL_ID)
+        _agents[session_id] = _build_agent(session_id)
+    return _agents[session_id]
 
-    return agent, ci_session_name, code_interpreter_tool
+
+@app.entrypoint
+async def invoke(payload, context):
+    """Stream the agent's response as SSE events.
+
+    Each yielded dict becomes one SSE event. Strands' `stream_async`
+    yields a mix of event types; we forward only `data` text deltas
+    and `current_tool_use` events (dedup'd by toolUseId so a single
+    tool call doesn't fan out to dozens of "tool_use" events as the
+    input streams in).
+    """
+    prompt = payload.get("prompt") if isinstance(payload, dict) else None
+    if not prompt:
+        yield {"error": "missing 'prompt' in payload"}
+        return
+
+    session_id = (context.session_id if context else None) or "default"
+    agent = _get_agent(session_id)
+
+    log.info("invoke session=%s prompt=%r", session_id, prompt[:120])
+
+    announced_tool_uses: set[str] = set()
+    async for event in agent.stream_async(prompt):
+        if not isinstance(event, dict):
+            continue
+        delta = event.get("data")
+        if delta:
+            yield {"delta": delta}
+            continue
+        tool_use = event.get("current_tool_use")
+        if tool_use and isinstance(tool_use, dict):
+            use_id = tool_use.get("toolUseId")
+            name = tool_use.get("name")
+            if use_id and use_id not in announced_tool_uses and name:
+                announced_tool_uses.add(use_id)
+                yield {"tool_use": {"name": name, "id": use_id}}
+    yield {"complete": True}
+
+
+if __name__ == "__main__":
+    # BedrockAgentCoreApp.run() binds 0.0.0.0:8080 with /invocations + /ping.
+    app.run()
