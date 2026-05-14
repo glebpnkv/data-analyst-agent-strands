@@ -1,87 +1,117 @@
-# data-analyst-agent-strands
+# data-analyst-agent — hackathon baseline
 
-A [Strands](https://strandsagents.com/)-based data analyst agent that lives on AWS:
+**This branch (`hackathon/baseline-implementation`) is a stripped-down rebuild for AWS Workshop Studio accounts where Glue, Athena, Cognito, Route 53 and CDK-style IAM role creation are all blocked.** It is not intended to merge into `main`. The full-fat ECS / Cognito / Glue version still lives on `main`.
 
-- Reads from Athena over a Glue Data Catalog you point it at.
-- Authors and deploys [AWS Glue Python shell jobs](https://docs.aws.amazon.com/glue/latest/dg/add-job-python.html) into a target repo via PRs.
-- Streams answers (text, tables, plots) into a [Chainlit](https://docs.chainlit.io/) chat UI fronted by an ALB + Cognito SSO.
-- Runs ad-hoc Python (pandas / matplotlib / plotly) inside an isolated AgentCore Code Interpreter sandbox.
+## What's in this build
 
-The behavioural details — system prompt, skills, tool design, target Glue repo layout — live in [`agent/README.md`](agent/README.md).
+- The agent runs on **Bedrock AgentCore Runtime** (managed container service).
+- The Python sandbox is **AgentCore Code Interpreter** — no self-hosted ECS.
+- A **Chainlit** frontend runs **locally on your laptop** and calls the deployed runtime via `bedrock-agentcore.invoke_agent_runtime`. No public URL, no Cognito, no Route 53.
+- Data lives in **three S3 buckets** (raw / processed / gold). Everything is CSV — no Glue catalog, no Athena.
+- The agent can **deploy AWS Lambda pipelines** authored from chat. Because the runtime role's permissions boundary forbids `iam:*` and most `lambda:*`, the agent stages a pipeline spec in S3 and the **Chainlit frontend completes the deploy** using the more permissive credentials on your laptop.
+- Plots stream back to the chat via the same S3-rendezvous trick (PNGs and interactive Plotly charts).
 
-## Repo layout
+## Prerequisites
 
-```
-agent/             — the agent package: prompts, tools, hooks, MCP wiring,
-                     server entrypoint, target Glue-repo template, skills
-agent_server/      — shared FastAPI scaffold (sessions, streaming, display
-                     tools) the agent's `server/main.py` plugs into
-frontend/          — Chainlit chat UI; talks to the agent over SSE
-infra/             — AWS CDK app: Network / Data / Ecr / Auth / Compute stacks
-scripts/           — bootstrap, deploy, teardown, local-stack, sample data
-tests/             — pytest suite for agent tools
-```
+- An AWS Workshop Studio account (Bedrock model access enabled — including a Sonnet inference profile in `us-east-1`).
+- A local AWS CLI profile pointing at it. The setup below assumes `AWS_PROFILE=hackathon`.
+- `uv`, Docker Desktop (with `buildx`), and `python ≥ 3.12`.
 
-## Getting started
-
-For the full deploy walkthrough (Route 53 hosted zone, Cognito SSO, first deploy via `bootstrap.sh`, Glue prerequisites, target-repo bootstrap, GitHub PAT, etc.), see [`agent/README.md`](agent/README.md).
-
-Short version, once AWS account is bootstrapped and the hosted zone is in place:
+## First-time setup
 
 ```bash
-aws sso login
-./scripts/bootstrap.sh                    # first-time deploy
-aws secretsmanager put-secret-value \     # one-time GitHub PAT
-  --secret-id DataAnalystAgent/Dev/GithubPat \
-  --secret-string "<pat>"
+# 1. Install deps
+uv sync
 
-# Roll the agent service to pick up the new secret
-CLUSTER=$(aws ssm get-parameter --region eu-central-1 \
-  --name /data-analyst-agent/dev/cluster-name \
-  --query Parameter.Value --output text)
-AGENT_SVC=$(aws ssm get-parameter --region eu-central-1 \
-  --name /data-analyst-agent/dev/agent/service-name \
-  --query Parameter.Value --output text)
+# 2. Create the three S3 buckets, ECR repo, and the agent's IAM role
+AWS_PROFILE=hackathon uv run python scripts/hackathon_bootstrap.py
 
-aws ecs update-service \
-  --region eu-central-1 \
-  --cluster "$CLUSTER" \
-  --service "$AGENT_SVC" \
-  --force-new-deployment >/dev/null
+# 3. Seed the gold bucket with two demo datasets
+AWS_PROFILE=hackathon uv run python scripts/hackathon_seed_gold.py
 
-aws ecs wait services-stable \
-  --region eu-central-1 \
-  --cluster "$CLUSTER" \
-  --services "$AGENT_SVC"
-echo "agent rolled"
-
-# Add yourself as a Cognito user (admin-invite by email)
-USER_POOL_ID=$(aws ssm get-parameter --region eu-central-1 \
-  --name /data-analyst-agent/dev/cognito/user-pool-id \
-  --query Parameter.Value --output text)
-aws cognito-idp admin-create-user \
-  --user-pool-id "$USER_POOL_ID" \
-  --username <YOUR_EMAIL_ADDRESS> \
-  --user-attributes Name=email,Value=<YOUR_EMAIL_ADDRESS> Name=email_verified,Value=true \
-  --desired-delivery-mediums EMAIL
+# 4. Build + push the agent image, then create the AgentCore Runtime
+AWS_PROFILE=hackathon uv run python scripts/hackathon_deploy.py
 ```
 
-Visit `https://<your-domain>` to chat with the deployed agent.
+The bootstrap script's last line is a block of `export ...` — copy those into your shell, you'll need them in step 5.
 
-For local dev:
+The deploy script prints the runtime ARN at the end. Save it as `AGENT_RUNTIME_ARN`. Status is `CREATING` for 1–3 minutes; check with:
 
 ```bash
-./scripts/run_local_stack.sh   # Phoenix + Postgres + agent + Chainlit
+AWS_PROFILE=hackathon aws bedrock-agentcore-control get-agent-runtime \
+  --region us-east-1 \
+  --agent-runtime-id <runtime-id-from-the-arn> \
+  --query status --output text
 ```
 
-## Cost ballpark (idle)
-
-~$80–100/mo with the dev stack fully deployed: NAT gateway $32 + RDS $13 + 2 ALBs $32 + storage/secrets $3, ECS task hours +$15–30. Bedrock + Athena pay-per-use on top. Tear down between demos:
+## Running the chat UI
 
 ```bash
-./scripts/teardown_dev_stack.sh
+AWS_PROFILE=hackathon \
+AGENT_RUNTIME_ARN=arn:aws:bedrock-agentcore:us-east-1:<acct>:runtime/data_analyst_agent-XXXXX \
+BUCKET_RAW=hackathon-da-raw-<acct>-us-east-1 \
+BUCKET_PROCESSED=hackathon-da-processed-<acct>-us-east-1 \
+BUCKET_GOLD=hackathon-da-gold-<acct>-us-east-1 \
+uv run chainlit run frontend/hackathon_app.py -w
 ```
 
-## Heritage
+Opens at <http://localhost:8000>. Use the paper-clip to attach a CSV/Excel — it's pushed to the raw bucket and the agent is told the S3 key.
 
-This agent originated in [`langchain-strands-aws-comparison`](https://github.com/glebpnkv/langchain-strands-aws-comparison) as `agents/strands_glue_pipeline_agent/`, then split out here so it can iterate independently and own its own CI.
+## Iteration loop
+
+| You changed… | Do this |
+|---|---|
+| `frontend/hackathon_app.py` | Save — Chainlit's `-w` reloads automatically. |
+| `agent/agentcore_app.py` (or anything in the container) | `uv run python scripts/hackathon_deploy.py`, wait for runtime status `READY`. |
+| `pyproject.toml` (laptop deps only — e.g. plotly pin) | `uv sync`, restart Chainlit. |
+| `scripts/hackathon_bootstrap.py` (IAM, buckets) | Re-run the bootstrap script — it's idempotent and re-applies the inline policy. |
+
+## What's blocked and what we worked around
+
+The Workshop Studio account's `WSParticipantRole` has these blocks. Spelled out so a colleague can sanity-check before debugging:
+
+- `glue:CreateDatabase` / write — agent doesn't use Glue. CSV-only via S3.
+- `athena:StartQueryExecution` — same; in-sandbox pandas instead of Athena.
+- `route53:*`, ACM cert validation — no custom domain. Chainlit on `localhost`.
+- `iam:CreateRole` for arbitrary names — only `aiagent-*` / `mcp-*` / `backoffice-*` with the `workshop-boundary` permissions boundary. We name everything `aiagent-*`.
+
+The `workshop-boundary` itself caps the runtime role's effective permissions further:
+
+- Denies `iam:*` outright, allows only `lambda:InvokeFunction` (no `CreateFunction`/`ListFunctions`/etc).
+- So the agent's `deploy_pipeline_as_lambda` and `list_pipelines` tools route through S3 and let the Chainlit host (running as `WSParticipantRole`, which DOES have those perms) do the actual create/update.
+
+The pandas Lambda layer (`AWSSDKPandas-Python312`) is also blocked from cross-account access on this account, so deployed Lambdas have only stdlib + boto3. Use the `csv` module for pipeline logic; pandas work happens in the AgentCore Code Interpreter sandbox where it's pre-installed.
+
+## Repo layout (this branch only)
+
+```
+agent/
+  agentcore_app.py      — AgentCore Runtime entrypoint + tools
+  Dockerfile.agentcore  — container image for the runtime
+frontend/
+  hackathon_app.py      — Chainlit UI + host-side Lambda deployer + image renderer
+scripts/
+  hackathon_bootstrap.py — buckets, ECR repo, IAM role
+  hackathon_seed_gold.py — two demo CSVs into the gold bucket
+  hackathon_deploy.py    — build, push, CreateAgentRuntime / UpdateAgentRuntime
+```
+
+The rest of the tree (`agent/server/`, `agent_server/`, `infra/`, `sandbox/`, `agent/skills/`, etc.) is unused on this branch — kept around so the diff against `main` is small.
+
+## Demo flow
+
+1. *"What datasets do you have?"* → agent calls `list_s3_dataset("gold")`.
+2. *"Do EDA on the monthly sales data."* → loads, runs pandas, shows summary stats and a Plotly chart.
+3. Drop a CSV via the paper-clip → agent picks it up from `raw/uploads/<id>/<filename>`.
+4. *"Set up a pipeline that summarises this CSV daily."* → agent prototypes, queues a spec to `processed/_pipelines/pending/`, and within seconds the frontend posts: *"✅ Deployed `aiagent-lambda-xxx`"*.
+5. *"Invoke it once."* → agent calls `invoke_pipeline`, returns the response and log tail.
+
+## Logs
+
+| Where | Command |
+|---|---|
+| Chainlit (local) | The terminal you ran `chainlit run` in. |
+| Agent (AgentCore Runtime) | `aws logs tail /aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT --region us-east-1 --since 30m --follow` |
+| Deployed Lambda pipelines | `aws logs tail /aws/lambda/<function-name> --region us-east-1 --since 30m --follow` (log group is auto-created on first invoke) |
+
+The AgentCore Code Interpreter sandbox itself is opaque — its internals aren't surfaced in CloudWatch. The agent's logs in (2) are the closest you get.
