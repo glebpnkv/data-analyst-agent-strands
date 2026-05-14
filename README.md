@@ -82,31 +82,35 @@ The `workshop-boundary` itself caps the runtime role's effective permissions fur
 
 The pandas Lambda layer (`AWSSDKPandas-Python312`) is also blocked from cross-account access on this account, so deployed Lambdas have only stdlib + boto3. Use the `csv` module for pipeline logic; pandas work happens in the AgentCore Code Interpreter sandbox where it's pre-installed.
 
-## Repo layout (this branch only)
+## Repo layout
 
 ```
 agent/
-  agent.py              — AgentCore Runtime entrypoint + tools
-  skills/build-pipeline/ — bronze/silver/gold pipeline workflow skill
-  skills/sandbox-artifacts/ — display-tool conventions (paths, plotly Tables)
-  Dockerfile.agentcore  — container image for the runtime
+  agent.py                  — AgentCore Runtime entrypoint + tools
+  Dockerfile.agentcore      — container image for the runtime
+  skills/
+    build-pipeline/         — bronze/silver/gold pipeline workflow skill
+    sandbox-artifacts/      — display-tool conventions (paths, Plotly tables)
 frontend/
-  hackathon_app.py      — Chainlit UI + host-side Lambda deployer + image renderer
+  hackathon_app.py          — Chainlit UI + host-side Lambda deployer + image renderer
+  chainlit_schema_sqlite.sql — schema for the local conversation-history DB
+public/
+  sidebar.js, stylesheet.css — right-hand "Datasets" sidebar
 scripts/
-  hackathon_bootstrap.py — buckets, ECR repo, IAM role
-  hackathon_seed_gold.py — two demo CSVs into the gold bucket
-  hackathon_deploy.py    — build, push, CreateAgentRuntime / UpdateAgentRuntime
+  hackathon_bootstrap.py    — buckets, ECR repo, IAM role
+  hackathon_seed_gold.py    — two demo CSVs into the gold bucket
+  hackathon_deploy.py       — build, push, CreateAgentRuntime / UpdateAgentRuntime
+.chainlit/config.toml       — Chainlit config (sidebar custom_js wired here)
 ```
 
-The rest of the tree (`agent/server/`, `agent_server/`, `infra/`, `sandbox/`, `agent/skills/`, etc.) is unused on this branch — kept around so the diff against `main` is small.
+That's the whole live tree. (Earlier commits on this branch carried a lot of `main`-branch dead code — `agent_server/`, `infra/`, `sandbox/`, `agent/server/`, etc. — all removed in the submission tidy-up.)
 
 ## Demo flow
 
-1. *"What datasets do you have?"* → agent calls `list_s3_dataset("gold")`.
+1. *"What datasets do you have?"* → agent calls `list_s3_dataset("gold")`. Sidebar also lists CSVs across all three buckets.
 2. *"Do EDA on the monthly sales data."* → loads, runs pandas, shows summary stats and a Plotly chart.
 3. Drop a CSV via the paper-clip → agent picks it up from `raw/uploads/<id>/<filename>`.
-4. *"Set up a pipeline that summarises this CSV daily."* → agent prototypes, queues a spec to `processed/_pipelines/pending/`, and within seconds the frontend posts: *"✅ Deployed `aiagent-lambda-xxx`"*.
-5. *"Invoke it once."* → agent calls `invoke_pipeline`, returns the response and log tail.
+4. *"Build me a gold pipeline for this CSV."* → agent loads the `build-pipeline` skill, prototypes the transform in the sandbox (stdlib + boto3 only), queues a spec to `processed/_pipelines/pending/`. Frontend posts *"✅ Deployed `aiagent-lambda-gold-...`"* within seconds, then auto-prompts the agent to invoke + sample the output. No second user message needed.
 
 ## Logs
 
