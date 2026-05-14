@@ -426,14 +426,26 @@ def _do_deploy(
             code = e.response["Error"]["Code"]
             msg = str(e)
             if code == "ResourceConflictException":
-                # Already exists → update in place
+                # Already exists → update in place. Lambda only allows
+                # one in-flight mutation per function at a time, so we
+                # wait for the code update to finish propagating before
+                # poking the configuration. The function_updated_v2
+                # waiter polls GetFunctionConfiguration until
+                # LastUpdateStatus != "InProgress".
                 resp = _lam.update_function_code(
                     FunctionName=function_name, ZipFile=zip_bytes
                 )
-                # Best-effort config refresh (env vars may have changed)
+                _lam.get_waiter("function_updated_v2").wait(
+                    FunctionName=function_name,
+                    WaiterConfig={"Delay": 1, "MaxAttempts": 60},
+                )
                 _lam.update_function_configuration(
                     FunctionName=function_name,
                     Environment={"Variables": env_vars},
+                )
+                _lam.get_waiter("function_updated_v2").wait(
+                    FunctionName=function_name,
+                    WaiterConfig={"Delay": 1, "MaxAttempts": 60},
                 )
                 return resp["FunctionArn"]
             if (
