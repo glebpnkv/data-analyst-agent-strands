@@ -37,6 +37,7 @@ import boto3
 import chainlit as cl
 from botocore.exceptions import ClientError
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+from chainlit.server import app as _chainlit_app
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -45,6 +46,10 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 AGENT_RUNTIME_ARN = os.environ.get("AGENT_RUNTIME_ARN")
 BUCKET_RAW = os.environ.get("BUCKET_RAW")
 BUCKET_PROCESSED = os.environ.get("BUCKET_PROCESSED")
+# Optional: only surfaced in the right-hand "Datasets" sidebar. Gold may
+# not be configured in every local environment, so we degrade gracefully
+# rather than raising at import.
+BUCKET_GOLD = os.environ.get("BUCKET_GOLD")
 
 if not AGENT_RUNTIME_ARN:
     raise RuntimeError("AGENT_RUNTIME_ARN env var is required")
@@ -119,6 +124,74 @@ _s3 = _session.client("s3")
 _lam = _session.client("lambda")
 _iam = _session.client("iam")
 _sts = _session.client("sts")
+
+# --------------------------------------------------------------------------
+# Right-hand "Datasets" sidebar endpoint
+# --------------------------------------------------------------------------
+# Surfaced to the browser by public/sidebar.js (enabled via
+# .chainlit/config.toml -> custom_js). Lists every .csv across the three
+# project buckets so the user can see what's available without prompting
+# the agent. The endpoint piggybacks on Chainlit's own FastAPI app so it
+# shares origin and process with the chat UI — no CORS, no second server.
+
+_SIDEBAR_BUCKETS: list[tuple[str, str | None]] = [
+    ("raw", BUCKET_RAW),
+    ("processed", BUCKET_PROCESSED),
+    ("gold", BUCKET_GOLD),
+]
+
+
+def _list_csvs(bucket: str) -> list[dict]:
+    """Paginated list of .csv objects in a bucket. Sync — call via to_thread."""
+    out: list[dict] = []
+    paginator = _s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket):
+        for obj in page.get("Contents", []) or []:
+            key = obj["Key"]
+            if not key.lower().endswith(".csv"):
+                continue
+            out.append(
+                {
+                    "key": key,
+                    "name": key.rsplit("/", 1)[-1],
+                    "size": obj.get("Size", 0),
+                    "last_modified": (
+                        obj["LastModified"].isoformat() if obj.get("LastModified") else None
+                    ),
+                }
+            )
+    out.sort(key=lambda f: f["last_modified"] or "", reverse=True)
+    return out
+
+
+async def list_datasets() -> dict:
+    """List every .csv across raw / processed / gold buckets."""
+    groups: list[dict] = []
+    for label, bucket in _SIDEBAR_BUCKETS:
+        if not bucket:
+            groups.append(
+                {"label": label, "bucket": None, "files": [], "error": "not configured"}
+            )
+            continue
+        try:
+            files = await asyncio.to_thread(_list_csvs, bucket)
+            groups.append({"label": label, "bucket": bucket, "files": files})
+        except ClientError as e:
+            log.warning("list_datasets: %s failed: %s", bucket, e)
+            groups.append(
+                {"label": label, "bucket": bucket, "files": [], "error": str(e)}
+            )
+    return {"groups": groups}
+
+
+# Chainlit's catch-all SPA route (@router.get("/{full_path:path}")) is
+# registered on the FastAPI app at import time, *before* this module runs.
+# A plain @_chainlit_app.get("/datasets") decorator would append our route
+# AFTER the catch-all, so it would never match. We register and then move
+# it to the front of the routes list.
+_chainlit_app.add_api_route("/datasets", list_datasets, methods=["GET"])
+_chainlit_app.router.routes.insert(0, _chainlit_app.router.routes.pop())
+
 
 # Mirror agent-side prefix names so the protocol matches.
 PIPELINE_PENDING_PREFIX = "_pipelines/pending/"
