@@ -27,16 +27,23 @@ import re
 import time
 import uuid
 import zipfile
+from pathlib import Path
 from typing import Any
 
 import boto3
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from botocore.exceptions import ClientError
-from strands import Agent, tool
+from strands import Agent, AgentSkills, tool
 from strands.models import BedrockModel
 from strands_tools.code_interpreter.agent_core_code_interpreter import (
     AgentCoreCodeInterpreter,
 )
+
+# Skills directory shipped alongside this module. AgentSkills exposes
+# each `<dir>/SKILL.md` to the model as a discoverable skill it can
+# read on demand — keeps the system prompt small while letting the
+# model pull in detailed playbooks (e.g. build-pipeline) when relevant.
+SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,62 +109,26 @@ _IMAGE_CONTENT_TYPES = {
 # with stdlib `csv` + boto3.
 
 SYSTEM_PROMPT = f"""\
-You are a data-analyst assistant for a hackathon demo. The user can ask
-you to explore datasets and propose data pipelines.
+You are a data-analyst assistant for a hackathon demo. You explore
+datasets and build data pipelines end-to-end.
 
 You work with three S3 buckets in {REGION}:
   - raw       ({BUCKET_RAW}):       pristine uploads (CSV, Excel) — never modify
   - processed ({BUCKET_PROCESSED}): cleaned / normalised intermediates
   - gold      ({BUCKET_GOLD}):      final curated datasets ready for analysis
 
-Tools available:
-  - `code_interpreter`: an isolated Python sandbox (pandas / numpy /
-    matplotlib / pyarrow pre-installed). Use it for any code execution.
-    The sandbox has NO direct S3 or internet access — use the S3 tools
-    below to bridge files in and out.
-  - `list_s3_dataset(tier)`: list objects in raw/processed/gold.
-  - `load_s3_into_sandbox(tier, key, local_filename=None)`: download an
-    S3 object into the sandbox workspace (binary-safe — parquet, Excel,
-    and CSV all work). Returns the workspace path you can then read
-    with pandas. Call this BEFORE asking the sandbox to read a dataset.
-  - `save_sandbox_to_s3(local_filename, tier, key)`: push a sandbox file
-    back to S3. Only `processed` and `gold` are writable.
-  - `display_image(workspace_path, caption="")`: show a STATIC image
-    (PNG / JPG / SVG) to the user. Use after `plt.savefig(...)`.
-  - `display_plotly(workspace_path, caption="")`: show an INTERACTIVE
-    Plotly chart. Save the figure as JSON in the sandbox first via
-    `fig.write_json('plots/chart.json')` (or `open(...).write(fig.to_json())`)
-    then call this with the path. Prefer this over `display_image` for
-    plots, since the user can hover / zoom / pan.
-
-  IMPORTANT: saving a file to the sandbox alone won't make it appear
-  in the chat — you MUST call `display_image` or `display_plotly` to
-  surface it. Pick `display_plotly` whenever you can (better UX).
-  - `deploy_pipeline_as_lambda(name, code, description="")`: QUEUE a
-    Python pipeline for deployment. The code must define
-    `def handler(event, context)`. The deployed Lambda has only the
-    python3.12 stdlib + boto3 (no pandas). Bucket names will be
-    available inside the handler as BUCKET_RAW / BUCKET_PROCESSED /
-    BUCKET_GOLD env vars. Important: this tool returns `status:queued`,
-    not `created`. Your execution role cannot itself call CreateFunction
-    or any IAM action — those are done by the host-side deployer
-    (Chainlit), which picks the spec up from S3 within seconds of your
-    turn ending and posts a confirmation message in the chat. Tell the
-    user "I've queued the pipeline — the frontend will deploy it now".
-    Do NOT immediately try to invoke the pipeline after deploying;
-    wait for the user to confirm, or to ask you to test it.
-  - `invoke_pipeline(name, payload=None)`: invoke an already-deployed
-    pipeline. Only call this after the user has confirmed the deploy.
-  - `list_pipelines()`: list pipelines currently deployed in the
-    account (reads the host-deployer's active-manifest in the processed
-    bucket).
-
-EDA workflow: list the relevant bucket, load the dataset into the
-sandbox, explore (column types, summary stats, distributions, missing
-values, correlations), plot when useful and save plots as PNG files.
-For pipelines: prototype the transformation logic in the sandbox first
-so you know it works on the data, THEN package the validated code as a
-Lambda via deploy_pipeline_as_lambda.
+Tools (see each tool's docstring for usage details):
+  - `code_interpreter` — Python sandbox (pandas / numpy / matplotlib /
+    pyarrow). No direct S3 or internet — use the S3 bridge tools.
+  - `list_s3_dataset`, `load_s3_into_sandbox`, `save_sandbox_to_s3` —
+    S3 ↔ sandbox bridges.
+  - `display_image`, `display_plotly` — surface a sandbox file as an
+    inline chart/image in the chat. Saving to the sandbox alone does
+    NOT show anything; you must call one of these. Prefer plotly.
+  - `deploy_pipeline_as_lambda`, `invoke_pipeline`, `list_pipelines` —
+    pipeline lifecycle. The full workflow lives in the `build-pipeline`
+    skill — read it the moment the user mentions a pipeline / ETL /
+    transformation / bronze / silver / gold.
 """
 
 app = BedrockAgentCoreApp()
@@ -589,7 +560,11 @@ def _build_agent(session_id: str) -> Agent:
                 pass
         return {"pipelines": out, "count": len(out)}
 
-    return Agent(
+    # Pull in `agent/skills/*/SKILL.md` as a discoverable plugin. The
+    # model can read these on-demand (kept out of the always-on system
+    # prompt to keep tokens lean) — `build-pipeline` is the headline
+    # one for this branch but everything in the dir gets exposed.
+    agent_kwargs: dict[str, Any] = dict(
         model=model,
         system_prompt=SYSTEM_PROMPT,
         tools=[
@@ -604,6 +579,9 @@ def _build_agent(session_id: str) -> Agent:
             list_pipelines,
         ],
     )
+    if SKILLS_DIR.exists():
+        agent_kwargs["plugins"] = [AgentSkills(skills=str(SKILLS_DIR))]
+    return Agent(**agent_kwargs)
 
 
 def _get_agent(session_id: str) -> Agent:

@@ -1,19 +1,19 @@
 ---
 name: sandbox-artifacts
-description: How to produce analysis artifacts (charts, tables, images) inside the AgentCore code interpreter sandbox and hand them off to the display_dataframe / display_plotly / display_image tools without paying per-token cost for the bytes. Activate this skill any time you intend to show the user a table, chart, or image — it is the **only** safe way.
+description: How to produce analysis artifacts (charts, tables, images) inside the AgentCore code interpreter sandbox and hand them off to the display_plotly / display_image tools without paying per-token cost for the bytes. Activate this skill any time you intend to show the user a chart, image, or table — it is the **only** safe way.
 ---
 
 # Sandbox Artifacts Skill
 
 ## Purpose
 
-The agent has three tools that surface inline UI in the chat:
+The agent has two tools that surface inline UI in the chat:
 
-- `display_dataframe` — renders a table
-- `display_plotly` — renders an interactive Plotly chart
-- `display_image` — renders an image (matplotlib, plotly static, PNG/JPEG/SVG)
+- `display_plotly` — renders an interactive Plotly chart (or a styled
+  `plotly.graph_objects.Table` when you want a real tabular widget).
+- `display_image` — renders an image (matplotlib, plotly static, PNG/JPEG/SVG).
 
-All three accept a **sandbox file path**. The tool reads and parses the
+Both accept a **sandbox file path**. The tool reads and parses the
 file in the agent service process — bytes never enter the LLM context.
 
 If you instead pass the data *inline* (a giant CSV string, a Plotly
@@ -21,11 +21,19 @@ figure JSON, or a base64-encoded PNG) you force the model to emit every
 byte as output tokens. This is slow, expensive, and a frequent cause of
 conversation hangs. **Always go through a sandbox file.**
 
+There is no `display_dataframe` tool on this branch. To show tabular
+output:
+
+- For small / narrow tables: print `df.head(10).to_markdown(index=False)`
+  in the sandbox and embed the markdown in your reply.
+- For larger / styled tables: build a `plotly.graph_objects.Table`,
+  write it to JSON, and surface via `display_plotly` (recipe below).
+
 ## When to use this skill
 
 Activate this skill the moment you decide to show the user a chart,
-table, or image. It applies in addition to whatever workflow skill is
-already active (Athena query execution, Glue diagnostics, etc.).
+image, or table. It applies in addition to whatever workflow skill is
+already active (e.g. `build-pipeline`).
 
 ## Required directory layout
 
@@ -34,8 +42,7 @@ sandbox is ephemeral, so cleanup is unnecessary.
 
 ```
 tmp/analysis_outputs/
-├── dataframes/    # CSV (preferred) or JSON-records files
-├── plotly/        # Plotly figure JSON files
+├── plotly/        # Plotly figure JSON files (charts and Table widgets)
 └── images/        # PNG / JPEG / SVG image files
 ```
 
@@ -72,7 +79,6 @@ Create the parent directories once per session if they don't exist:
 
 ```python
 import os
-os.makedirs("tmp/analysis_outputs/dataframes", exist_ok=True)
 os.makedirs("tmp/analysis_outputs/plotly", exist_ok=True)
 os.makedirs("tmp/analysis_outputs/images", exist_ok=True)
 ```
@@ -84,37 +90,52 @@ of the same kind in a single turn, append a small disambiguator (a
 counter or short uuid) — never a timestamp, the user doesn't see it:
 
 ```
-tmp/analysis_outputs/dataframes/orders_by_day.csv
 tmp/analysis_outputs/plotly/orders_by_day.json
 tmp/analysis_outputs/plotly/orders_by_day_log_scale.json
+tmp/analysis_outputs/plotly/orders_table.json
 tmp/analysis_outputs/images/orders_heatmap.png
 ```
 
 ## Recipes
 
-### DataFrames
+### Tables (markdown — preferred for narrow output)
 
-Prefer **CSV** for tabular output — it's the smallest text format and
-the same format `athena_query_to_ci_csv` already produces, so you can
-reuse a CSV that's already in the sandbox without rewriting it.
+For small tables (≤10 rows, ≤6-ish columns), markdown is the cheapest
+path: it embeds straight into your assistant reply with no extra tool
+call.
 
 ```python
 import pandas as pd
 df = pd.DataFrame(...)  # or read an existing sandbox CSV
-df.to_csv("tmp/analysis_outputs/dataframes/results.csv", index=False)
+print(df.head(10).to_markdown(index=False))
 ```
 
-Then call:
-```
-display_dataframe("tmp/analysis_outputs/dataframes/results.csv", title="Daily orders by region")
+Copy the printed markdown into your reply. Done.
+
+### Tables (Plotly — for wide / styled output)
+
+When markdown looks ugly (wide columns, lots of rows, or you want
+alignment / colour), build a `plotly.graph_objects.Table` and surface
+it as a regular Plotly chart:
+
+```python
+import plotly.graph_objects as go
+fig = go.Figure(
+    data=[go.Table(
+        header=dict(values=list(df.columns)),
+        cells=dict(values=[df[c] for c in df.columns]),
+    )]
+)
+fig.write_json("tmp/analysis_outputs/plotly/results_table.json")
 ```
 
-JSON records (`[{"col": 1}, ...]`) also work — use `.json` extension.
-The first row of a CSV is treated as the header.
+```
+display_plotly("tmp/analysis_outputs/plotly/results_table.json", caption="Daily orders by region")
+```
 
-If your dataframe has more than ~1000 rows, the tool truncates and
-flags it via a `truncated` indicator in the rendered table. For larger
-results, sample or aggregate first.
+If your dataframe has more than a few hundred rows, sample or
+aggregate first — a giant Table widget is awkward to read. Save the
+full CSV to S3 via `save_sandbox_to_s3` if the user might want it.
 
 ### Plotly charts
 
@@ -128,7 +149,7 @@ fig.write_json("tmp/analysis_outputs/plotly/orders_by_day.json")
 ```
 
 ```
-display_plotly("tmp/analysis_outputs/plotly/orders_by_day.json", title="Daily orders")
+display_plotly("tmp/analysis_outputs/plotly/orders_by_day.json", caption="Daily orders")
 ```
 
 The figure JSON file may be large (tens of KB to a few MB) — that's
@@ -145,11 +166,12 @@ plt.close(fig)
 ```
 
 ```
-display_image("tmp/analysis_outputs/images/heatmap.png", title="Order heatmap", mime="image/png")
+display_image("tmp/analysis_outputs/images/heatmap.png", caption="Order heatmap")
 ```
 
-Mime can be `image/png`, `image/jpeg`, or `image/svg+xml`. The
-default is `image/png`.
+The MIME type is sniffed from the file extension (`.png`, `.jpg`,
+`.jpeg`, `.gif`, `.svg`, `.webp`). Use a sensible extension and you
+don't need to think about it.
 
 ### Images (plotly static export)
 
@@ -169,12 +191,13 @@ Otherwise prefer `display_plotly` — interactive is almost always better.
    result back to a tool argument. The `display_image` tool reads the
    file itself.
 3. **Never** chain through prose: don't dump a 1,000-row CSV into the
-   chat as text and then describe it. Save it, render with
-   `display_dataframe`, and then optionally summarize in prose.
+   chat as text and then describe it. Aggregate or sample, render via
+   markdown table or `display_plotly` (Table or chart), then summarise.
 4. **Cap inline rendering by sampling, not by truncating prose.** If
-   the result has 50,000 rows, write the full CSV but pass an
-   aggregated/sampled CSV to `display_dataframe`. The user can still
-   ask follow-up questions over the full file.
+   the result has 50,000 rows, save the full CSV (e.g. via
+   `save_sandbox_to_s3`) but pass an aggregated/sampled view to
+   markdown / `display_plotly`. The user can still ask follow-up
+   questions over the full file.
 5. **One artifact per file.** Don't pack multiple charts into a single
    PNG just to save a `display_*` call.
 

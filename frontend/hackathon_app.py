@@ -128,6 +128,13 @@ LAMBDA_NAME_PREFIX = "aiagent-lambda-"
 # Image-display rendezvous — mirrors agent/agentcore_app.py.
 DISPLAY_PENDING_PREFIX = "_display/"
 
+# Cap on how many auto-continuation turns we'll chain after a single
+# user message. The build-pipeline skill expects exactly one auto-turn
+# per deploy (deploy → next turn invokes + samples), and a multi-tier
+# bronze → silver → gold flow needs three. Five gives headroom without
+# letting a runaway loop burn through tokens.
+MAX_AUTO_CONTINUATIONS = 5
+
 
 def _new_runtime_session_id() -> str:
     """AgentCore requires session ids of >= 33 chars. uuid hex is 32, so
@@ -177,6 +184,18 @@ async def on_message(msg: cl.Message) -> None:
         return
 
     prompt = "\n\n".join(prompt_parts)
+    await _run_agent_turn(prompt, runtime_session_id, auto_depth=0)
+
+
+async def _run_agent_turn(
+    prompt: str, runtime_session_id: str, auto_depth: int
+) -> None:
+    """Run one agent turn, then handle post-turn sweeps and (maybe) auto-continue.
+
+    `auto_depth` is the recursion counter: 0 for a real user message,
+    1+ for a system-fired continuation. Capped by MAX_AUTO_CONTINUATIONS
+    so a buggy skill can't fan out indefinitely.
+    """
     payload = json.dumps({"prompt": prompt}).encode("utf-8")
 
     # Pre-create the assistant message so stream_token can append to it.
@@ -219,10 +238,38 @@ async def on_message(msg: cl.Message) -> None:
     await assistant_msg.update()
 
     # Post-turn sweeps: render any images the agent queued for display,
-    # then deploy any pipelines it queued. Done in this order so the
-    # user sees their plot before the deploy progress message arrives.
+    # then deploy any pipelines it queued. Order matters so the user
+    # sees their plot before the deploy progress message arrives.
     await _render_pending_images()
-    await _deploy_pending_pipelines()
+    deployed = await _deploy_pending_pipelines()
+
+    # Auto-continuation: if any pipelines just went live, hand the
+    # agent a synthesized prompt so it can immediately invoke + sample
+    # without the user having to type "now test it". Capped recursion
+    # supports multi-tier flows (bronze → silver → gold) without
+    # letting a runaway loop fan out forever.
+    if deployed and auto_depth < MAX_AUTO_CONTINUATIONS:
+        # Phrasing matches the contract advertised in the build-pipeline
+        # skill so the agent recognises this as the auto-continuation
+        # cue rather than a fresh user request.
+        listing = "\n".join(
+            f"  - `{d['function_name']}` (arn: `{d['function_arn']}`)"
+            for d in deployed
+        )
+        sys_prompt = (
+            "[system] Pipeline deployment complete. The following Lambda "
+            "function(s) are now live and invokable:\n"
+            f"{listing}\n\n"
+            "Per the build-pipeline skill: invoke each one once via "
+            "`invoke_pipeline`, surface any errors honestly, then load "
+            "the output from S3 into the sandbox and show the user a "
+            "small sample (markdown table or display_plotly chart). "
+            "Do not ask the user for permission — this message IS the "
+            "go-ahead."
+        )
+        await _run_agent_turn(
+            sys_prompt, runtime_session_id, auto_depth=auto_depth + 1
+        )
 
 
 async def _upload_file_to_raw(file_el: cl.File) -> str:
@@ -310,8 +357,15 @@ def _emit_pending(buffer: list[str]):
 # ============================================================================
 
 
-async def _deploy_pending_pipelines() -> None:
-    """Sweep `_pipelines/pending/` and deploy each spec found."""
+async def _deploy_pending_pipelines() -> list[dict]:
+    """Sweep `_pipelines/pending/` and deploy each spec found.
+
+    Returns a list of `{function_name, function_arn}` dicts for every
+    pipeline that successfully went live in this sweep — the caller
+    uses this to fire an auto-continuation prompt at the agent.
+    Failed deploys are NOT included, so the agent doesn't try to
+    invoke a function that never existed.
+    """
     try:
         resp = await asyncio.to_thread(
             _s3.list_objects_v2,
@@ -320,7 +374,7 @@ async def _deploy_pending_pipelines() -> None:
         )
     except ClientError as e:
         log.warning("deploy sweep: list failed: %s", e)
-        return
+        return []
     # We trigger off manifest.json — its presence means the zip has
     # already been uploaded (the agent uploads the zip first, then the
     # manifest, see `deploy_pipeline_as_lambda`).
@@ -329,12 +383,19 @@ async def _deploy_pending_pipelines() -> None:
         for obj in resp.get("Contents", [])
         if obj["Key"].endswith("/manifest.json")
     ]
+    deployed: list[dict] = []
     for key in manifest_keys:
-        await _deploy_one(key)
+        result = await _deploy_one(key)
+        if result is not None:
+            deployed.append(result)
+    return deployed
 
 
-async def _deploy_one(manifest_key: str) -> None:
-    """Deploy a single pending pipeline. UI updates as it progresses."""
+async def _deploy_one(manifest_key: str) -> dict | None:
+    """Deploy a single pending pipeline. UI updates as it progresses.
+
+    Returns `{function_name, function_arn}` on success, None on failure.
+    """
     try:
         manifest = json.loads(
             (await asyncio.to_thread(
@@ -343,7 +404,7 @@ async def _deploy_one(manifest_key: str) -> None:
         )
     except Exception as e:  # noqa: BLE001
         log.warning("deploy: bad manifest %s: %s", manifest_key, e)
-        return
+        return None
     function_name = manifest["function_name"]
     suffix = manifest["suffix"]
     zip_s3_uri = manifest["zip_s3_uri"]
@@ -364,7 +425,7 @@ async def _deploy_one(manifest_key: str) -> None:
         log.exception("deploy %s failed", function_name)
         progress.content = f"❌ Deploy `{function_name}` failed: `{e}`"
         await progress.update()
-        return
+        return None
 
     # Move manifest from pending → active so list_pipelines sees it. We
     # add the function_arn to the active manifest so the agent doesn't
@@ -383,10 +444,10 @@ async def _deploy_one(manifest_key: str) -> None:
     await _delete_prefix(BUCKET_PROCESSED, pending_prefix)
 
     progress.content = (
-        f"✅ Deployed **`{function_name}`** → `{function_arn}`\n\n"
-        f"You can ask the agent to invoke it now."
+        f"✅ Deployed **`{function_name}`** → `{function_arn}`"
     )
     await progress.update()
+    return {"function_name": function_name, "function_arn": function_arn}
 
 
 def _do_deploy(
