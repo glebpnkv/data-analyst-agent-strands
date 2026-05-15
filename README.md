@@ -57,6 +57,34 @@ uv run chainlit run frontend/hackathon_app.py -w
 
 Opens at <http://localhost:8000>. Use the paper-clip to attach a CSV/Excel — it's pushed to the raw bucket and the agent is told the S3 key.
 
+## Running the chat UI on a locked-down (corp) Windows laptop
+
+When PyPI / Nexus blocks `chainlit`, side-load via S3:
+
+**One-time, on your Mac (or any machine with PyPI access):**
+
+```bash
+AWS_PROFILE=hackathon uv run python scripts/hackathon_build_wheelhouse.py
+```
+
+Builds Windows wheels for the frontend-only deps and uploads to
+`s3://hackathon-da-raw-<acct>-us-east-1/wheels/frontend-wheels.zip`.
+Re-run if a chainlit / boto3 / plotly version moves.
+
+**On the corp Windows laptop** (in PowerShell, in the cloned repo):
+
+```powershell
+aws s3 cp s3://hackathon-da-raw-<acct>-us-east-1/wheels/frontend-wheels.zip .
+Expand-Archive frontend-wheels.zip
+uv venv --python 3.12
+.venv\Scripts\activate
+uv pip install --no-index --find-links=frontend-wheels chainlit boto3 aiosqlite sqlalchemy greenlet plotly==5.22.0 python-dotenv
+```
+
+Then run the same `chainlit run frontend/hackathon_app.py -w` command
+as above (substituting `^` line continuations for the Bash `\` ones,
+or putting it all on one line).
+
 ## Iteration loop
 
 | You changed… | Do this |
