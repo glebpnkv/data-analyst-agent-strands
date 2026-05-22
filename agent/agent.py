@@ -6,7 +6,7 @@ from typing import Optional
 
 import boto3
 from mcp import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamable_http_client
+from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent, AgentSkills
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
@@ -230,7 +230,7 @@ def make_github_mcp_client() -> MCPClient:
     headers = {"Authorization": f"Bearer {pat}"}
 
     return MCPClient(
-        lambda: streamable_http_client(
+        lambda: streamablehttp_client(
             url=GITHUB_MCP_SERVER_URL,
             headers=headers,
         ),
