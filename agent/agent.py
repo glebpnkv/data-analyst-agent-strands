@@ -10,8 +10,8 @@ from mcp.client.streamable_http import streamable_http_client
 from strands import Agent, AgentSkills
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
+from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
-from sandbox_client import RemoteSandboxCodeInterpreter
 from utils.hooks import GlueJobRunPollThrottleHook
 from utils.prompts import SYSTEM_PROMPT
 from utils.tools import make_athena_query_to_ci_csv, make_glue_job_run_diagnostics_tool
@@ -349,27 +349,18 @@ def make_agent(
     region: str,
     model_id: str,
     mcp_client: MCPClient,
-    sandbox_http_url: Optional[str] = None,
-    sandbox_auth_token: Optional[str] = None,
-) -> tuple[Agent, Optional[str], Optional[RemoteSandboxCodeInterpreter]]:
+    enable_code_interpreter: bool = True,
+) -> tuple[Agent, Optional[str], Optional[AgentCoreCodeInterpreter]]:
     """
     Create the Data Analyst Strands agent.
 
-    Used by both local CLI mode and the FastAPI runtime. The code
-    interpreter is attached only when both `sandbox_http_url` and
-    `sandbox_auth_token` are provided — leaving them None gives a
-    degraded agent (no CI, no Athena→CSV handoff). The pool /
-    local-URL decision lives in the caller (agent/server/main.py),
-    not here.
+    One function is used by both local CLI mode and AgentCore runtime mode.
 
     :param profile: AWS profile name
     :param region: AWS region
     :param model_id: Bedrock model ID
     :param mcp_client: MCP client wrapper for Athena/Glue tools
-    :param sandbox_http_url: Base URL of a sandbox task (e.g. `http://10.0.1.42:8081`),
-        or None to skip attaching a code interpreter.
-    :param sandbox_auth_token: Shared-secret token the sandbox expects in
-        `X-Sandbox-Auth`. Required iff `sandbox_http_url` is set.
+    :param enable_code_interpreter: Whether to attach AgentCore code interpreter + CSV handoff tool
     :return: Agent, optional CI session name, optional code interpreter tool
     """
     session = boto3.Session(profile_name=profile, region_name=region)
@@ -388,20 +379,18 @@ def make_agent(
     skills_dir = Path(__file__).resolve().parent / "skills"
     skills_plugin = _create_skills_plugin(skills_dir)
     ci_session_name: Optional[str] = None
-    code_interpreter_tool: Optional[RemoteSandboxCodeInterpreter] = None
+    code_interpreter_tool: Optional[AgentCoreCodeInterpreter] = None
 
-    # Always include Glue runtime rules so both local CLI and the FastAPI
-    # runtime enforce the same job/role/trigger behavior.
+    # Always include Glue runtime rules so both local CLI and AgentCore runtime
+    # enforce the same job/role/trigger behavior.
     prompt_parts.append(_build_runtime_glue_rules())
     prompt_parts.append(_build_git_rules())
 
-    if sandbox_http_url and sandbox_auth_token:
-        # Per-call session name purely for log correlation; the kernel is
-        # one-per-task so the name doesn't gate state isolation.
-        ci_session_name = f"data-analyst-{uuid.uuid4().hex[:10]}"
-        code_interpreter_tool = RemoteSandboxCodeInterpreter(
-            http_url=sandbox_http_url,
-            auth_token=sandbox_auth_token,
+    if enable_code_interpreter:
+        # Keep one explicit CI session name to simplify tool handoff and artifact extraction.
+        ci_session_name = f"glue-pipeline-{uuid.uuid4().hex[:10]}"
+        code_interpreter_tool = AgentCoreCodeInterpreter(
+            region=region,
             session_name=ci_session_name,
         )
 
@@ -414,12 +403,6 @@ def make_agent(
 
         tools.extend([athena_query_to_ci_csv, code_interpreter_tool.code_interpreter])
         prompt_parts.append(_build_ci_handoff_rules(ci_session_name=ci_session_name))
-    elif sandbox_http_url or sandbox_auth_token:
-        # Either both or neither — half-set is almost always a misconfig.
-        raise ValueError(
-            "sandbox_http_url and sandbox_auth_token must be set together "
-            "(or both omitted to disable the code interpreter)."
-        )
 
     # Available in both local and runtime modes for failed-run debugging.
     glue_job_run_diagnostics = make_glue_job_run_diagnostics_tool(

@@ -2,26 +2,17 @@
 
 The registry knows nothing about Strands, MCP clients, code interpreters,
 or model providers. Each agent's `server/main.py` supplies an
-`agent_factory` async callable that builds a `ManagedAgent` (the agent
-plus a teardown to release per-session resources). The registry caches
-one `ManagedAgent` per `session_id`, evicts on idle TTL, and calls
-teardown on eviction or shutdown.
-
-Async contract:
-  - The factory is awaitable. This lets agents await per-session
-    resource claims (e.g. a sandbox task from a SandboxPool) without
-    juggling event-loop bridges from a thread pool.
-  - `teardown` may be sync or async. The registry awaits coroutines
-    and silently runs sync callables, so existing agents that pass a
-    plain `lambda: client.close()` keep working.
+`agent_factory` callable that builds a `ManagedAgent` (the agent plus a
+teardown to release per-session resources). The registry caches one
+`ManagedAgent` per `session_id`, evicts on idle TTL, and calls teardown
+on eviction or shutdown.
 """
 
 import asyncio
-import inspect
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,18 +29,13 @@ class ManagedAgent:
     of SDK-native events. `teardown` is called when the session is evicted
     or the app shuts down — use it to stop subprocesses, close clients,
     release sandbox sessions, etc.
-
-    `teardown` may return None (sync cleanup) or an awaitable
-    (async cleanup). The registry handles both — sync agents need
-    no changes; agents that need to await resource releases (e.g.
-    `await pool.release(claimed_task)`) just return a coroutine.
     """
 
     agent: Any
-    teardown: Callable[[], Awaitable[None] | None] = field(default=lambda: None)
+    teardown: Callable[[], None] = field(default=lambda: None)
 
 
-AgentFactory = Callable[[str], Awaitable[ManagedAgent]]
+AgentFactory = Callable[[str], ManagedAgent]
 
 
 @dataclass
@@ -80,7 +66,7 @@ class SessionRegistry:
             if len(self._sessions) >= self._settings.max_sessions:
                 await self._evict_oldest_locked()
 
-            managed = await self._agent_factory(sid)
+            managed = await asyncio.to_thread(self._agent_factory, sid)
             session = AgentSession(session_id=sid, managed=managed)
             self._sessions[sid] = session
             log.info("created session %s (active=%d)", sid, len(self._sessions))
@@ -89,7 +75,7 @@ class SessionRegistry:
     async def shutdown(self) -> None:
         async with self._registry_lock:
             for sid, session in list(self._sessions.items()):
-                await self._safe_teardown(session.managed)
+                await asyncio.to_thread(self._safe_teardown, session.managed)
                 self._sessions.pop(sid, None)
 
     async def _evict_expired_locked(self) -> None:
@@ -104,7 +90,7 @@ class SessionRegistry:
         for sid in expired_ids:
             session = self._sessions.pop(sid)
             log.info("evicting expired session %s", sid)
-            await self._safe_teardown(session.managed)
+            await asyncio.to_thread(self._safe_teardown, session.managed)
 
     async def _evict_oldest_locked(self) -> None:
         if not self._sessions:
@@ -112,13 +98,11 @@ class SessionRegistry:
         sid = min(self._sessions, key=lambda k: self._sessions[k].last_used_at)
         session = self._sessions.pop(sid)
         log.info("evicting oldest session %s to stay under max_sessions", sid)
-        await self._safe_teardown(session.managed)
+        await asyncio.to_thread(self._safe_teardown, session.managed)
 
     @staticmethod
-    async def _safe_teardown(managed: ManagedAgent) -> None:
+    def _safe_teardown(managed: ManagedAgent) -> None:
         try:
-            result = managed.teardown()
-            if inspect.isawaitable(result):
-                await result
+            managed.teardown()
         except Exception as e:
             log.warning("session teardown raised: %s", e)

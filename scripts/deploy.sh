@@ -216,11 +216,8 @@ case "$1" in
     # for a few minutes (Chainlit boots and shows the login form even
     # if the agent isn't up; the agent doesn't need the frontend at
     # all), so the order is a small optimization, not a hard
-    # dependency. Sandbox is built last; it has no service to roll
-    # out, so the order doesn't matter — putting it last keeps the
-    # output flow predictable.
+    # dependency.
     deploy_one "agent" "agent/Dockerfile"
     deploy_one "frontend" "frontend/Dockerfile"
-    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy_sandbox.sh"
     ;;
 esac

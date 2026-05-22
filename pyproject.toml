@@ -44,7 +44,6 @@ dev = [
     "aws-cdk-lib>=2.251.0",
     "constructs>=10.6.0",
     "pytest>=8.4.2",
-    "pytest-asyncio>=1.3.0",
     "ruff>=0.15.5",
 ]
 
