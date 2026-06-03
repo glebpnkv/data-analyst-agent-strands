@@ -19,6 +19,7 @@ from .display_tools import (
     make_display_plotly_tool,
 )
 from .observability import Observability, setup as setup_observability
+from .sandbox_discovery import discover_from_ecs_metadata
 from .sandbox_pool import ClaimedTask, PoolConfig, SandboxPool
 from .sessions import AgentFactory, ManagedAgent
 from .streaming import EventReducer, ReducerFactory, StrandsEventReducer
@@ -37,6 +38,7 @@ __all__ = [
     "StrandsEventReducer",
     "UIEmitter",
     "create_app",
+    "discover_from_ecs_metadata",
     "get_current_emitter",
     "load_base_settings",
     "make_display_dataframe_tool",

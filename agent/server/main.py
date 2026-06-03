@@ -39,6 +39,7 @@ from agent_server import (
     SandboxPool,
     StrandsEventReducer,
     create_app,
+    discover_from_ecs_metadata,
     make_display_dataframe_tool,
     make_display_image_tool,
     make_display_plotly_tool,
@@ -77,7 +78,18 @@ def _resolve_sandbox() -> tuple[SandboxPool | None, str | None, str | None]:
 
     Returns `(pool, local_url, local_token)`. Exactly one of `pool`
     or `local_url+local_token` is populated; the other side is None.
-    Raises on missing required env in either mode.
+
+    Pool-mode config sources (per field, first match wins):
+      1. Explicit `SANDBOX_*` env var.
+      2. Self-discovery from the agent's own ECS task metadata + boto3
+         lookups (only when running inside an ECS task).
+      3. Raise.
+
+    Only `AWS_REGION` (or `AWS_DEFAULT_REGION`) is *always* required —
+    every other pool field is auto-derivable from the running task's
+    own ECS context when the agent runs in an ECS task. Local
+    development still needs explicit `SANDBOX_LOCAL_URL` +
+    `SANDBOX_AUTH_TOKEN`.
     """
     local_url = (os.environ.get("SANDBOX_LOCAL_URL") or "").strip()
     if local_url:
@@ -94,21 +106,10 @@ def _resolve_sandbox() -> tuple[SandboxPool | None, str | None, str | None]:
         )
         return None, local_url, token
 
-    cluster_name = (os.environ.get("SANDBOX_CLUSTER_NAME") or "").strip()
-    if not cluster_name:
-        raise RuntimeError(
-            "no sandbox configured. Set SANDBOX_LOCAL_URL+SANDBOX_AUTH_TOKEN for local dev "
-            "or SANDBOX_CLUSTER_NAME (+ task def / subnets / SG) for pool mode."
-        )
-
-    subnet_ids_raw = _required_env("SANDBOX_SUBNET_IDS")
-    subnet_ids = [s.strip() for s in subnet_ids_raw.split(",") if s.strip()]
-    if not subnet_ids:
-        raise RuntimeError("SANDBOX_SUBNET_IDS must contain at least one subnet")
-
-    # Region for the pool's boto3 clients. Falls through AWS_REGION ->
-    # AWS_DEFAULT_REGION; if neither is set the pool would fail with
-    # NoRegionError on first refill — fail loud here instead.
+    # Region for the pool's boto3 clients (and for self-discovery's own
+    # boto3 lookups below). Falls through AWS_REGION -> AWS_DEFAULT_REGION;
+    # if neither is set, fail loud here rather than at first refill with
+    # a deferred NoRegionError.
     region = (
         os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or ""
     ).strip()
@@ -118,15 +119,71 @@ def _resolve_sandbox() -> tuple[SandboxPool | None, str | None, str | None]:
             "ECS / EC2 boto3 clients."
         )
 
+    # Attempt self-discovery from ECS task metadata. Returns None if we're
+    # not in an ECS task (= local dev attempting pool mode); returns a
+    # (possibly empty) dict otherwise. Any individual lookup that fails is
+    # silently absent from the dict, so explicit env vars still work as
+    # the last word for any field discovery couldn't fill.
+    discovered = discover_from_ecs_metadata(region) or {}
+
+    def _env_or_discovered(env_name: str, discovered_key: str) -> str:
+        v = (os.environ.get(env_name) or "").strip()
+        if v:
+            return v
+        v = (discovered.get(discovered_key) or "").strip() if isinstance(
+            discovered.get(discovered_key), str
+        ) else (discovered.get(discovered_key) or "")
+        if not v:
+            raise RuntimeError(
+                f"{env_name} not set and could not be auto-discovered from ECS task "
+                f"metadata. Set it explicitly, or run the agent inside an ECS task "
+                f"so this can be derived from `ECS_CONTAINER_METADATA_URI_V4` + "
+                f"ecs:DescribeTasks + ec2:DescribeNetworkInterfaces. "
+                f"Alternatively for local development, set SANDBOX_LOCAL_URL + "
+                f"SANDBOX_AUTH_TOKEN to use a single fixed sandbox URL."
+            )
+        return v
+
+    cluster_name = _env_or_discovered("SANDBOX_CLUSTER_NAME", "cluster_name")
+    task_definition_arn = _env_or_discovered(
+        "SANDBOX_TASK_DEFINITION_ARN", "task_definition_arn"
+    )
+    security_group_id = _env_or_discovered(
+        "SANDBOX_SECURITY_GROUP_ID", "security_group_id"
+    )
+
+    # Subnet ids need list handling, so don't go through _env_or_discovered.
+    subnet_ids_raw = (os.environ.get("SANDBOX_SUBNET_IDS") or "").strip()
+    if subnet_ids_raw:
+        subnet_ids = [s.strip() for s in subnet_ids_raw.split(",") if s.strip()]
+    else:
+        subnet_ids = list(discovered.get("subnet_ids") or [])
+    if not subnet_ids:
+        raise RuntimeError(
+            "SANDBOX_SUBNET_IDS not set and could not be auto-discovered from ECS "
+            "task metadata. Set it explicitly, or run the agent inside an ECS task."
+        )
+
+    # container_name has a sensible default (`sandbox`, matching the
+    # dev-environment task def) and only matters when the override targets
+    # a container that exists in the task definition. Discovery still helps
+    # in Flavour 1 setups where the agent task's container is named
+    # something other than `sandbox`.
+    container_name = (
+        (os.environ.get("SANDBOX_CONTAINER_NAME") or "").strip()
+        or discovered.get("container_name")
+        or "sandbox"
+    )
+
     config = PoolConfig(
         cluster_name=cluster_name,
-        task_definition_arn=_required_env("SANDBOX_TASK_DEFINITION_ARN"),
+        task_definition_arn=task_definition_arn,
         subnet_ids=subnet_ids,
-        security_group_id=_required_env("SANDBOX_SECURITY_GROUP_ID"),
+        security_group_id=security_group_id,
         region=region,
         pool_size=int(os.environ.get("SANDBOX_POOL_SIZE") or "2"),
         sandbox_port=int(os.environ.get("SANDBOX_PORT") or "8081"),
-        container_name=os.environ.get("SANDBOX_CONTAINER_NAME") or "sandbox",
+        container_name=container_name,
     )
     return SandboxPool(config), None, None
 
