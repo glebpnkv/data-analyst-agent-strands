@@ -61,7 +61,218 @@ In unrestricted accounts, run AgentCore Evaluations as a parallel track. Enable 
 - **Unrestricted dev account, eu-central-1:** Phoenix + DeepEval is the cheapest credible answer at ~$110/mo all-in. If AgentCore is in region and the account isn't SCP-restricted, dual-export to AgentCore for the AWS-native option. Total setup: one weekend of focused work.
 - **Restricted production environment:** the *exact same* Phoenix + DeepEval stack ports cleanly because both run in-VPC and Bedrock is the judge. Langfuse self-host is the next step up if the team grows past three engineers. AgentCore Evaluations is out of scope as long as the SCP blocks `bedrock-agentcore:*` — and if the SCP is lifted, it slots in as a dual-export with one env-var change.
 
-## 5. Eval methodology for this agent
+## 5. How development and CI work day-to-day
+
+This section walks through what actually happens, in order, when someone changes the agent. If you read nothing else, read this section — the rest of the doc makes more sense once this picture is in your head.
+
+**Prerequisites.** Two things must be in place before any of this works:
+
+1. **Phoenix is deployed in the AWS account** (one Fargate task, a logical database on the existing Aurora — see workplan M1).
+2. **DeepEval is installed in the agent repo** as a Python library (a line in `pyproject.toml`). Nothing to deploy; it lives in the dev/CI Python environment.
+
+Everything below assumes those are done.
+
+### 5.1 What a developer does, in order
+
+Imagine a developer ("Sam") wants to teach the agent to handle year-over-year revenue questions. Sam's day:
+
+**1. Write the eval case first (or alongside the code).** Sam adds a new JSON file to `eval/goldens/yoy_growth.json`:
+
+```json
+{
+  "id": "yoy-growth-2024-vs-2025",
+  "tags": ["athena", "aggregation"],
+  "input": "What was the year-over-year revenue growth from 2024 to 2025?",
+  "expected_result_set": {"row_count": 1, "columns_subset": ["yoy_pct"]},
+  "expected_tools": [
+    {"name": "athena_query_to_ci_csv",
+     "arguments_match": {"sql_regex": "(?i)2024.*2025"}}
+  ]
+}
+```
+
+The file is checked into git like any other source. Reviewers see new goldens in PR diffs the same way they see new unit tests.
+
+**2. Run that one case locally.**
+
+```bash
+uv run deepeval test run tests/evals/test_agent_evals.py -k "yoy-growth" -s
+```
+
+This calls the local agent against the developer's AWS dev account, scores the response with the chosen metrics, and prints the judge model's reasoning to the terminal. ~20 seconds. A couple of cents in Bedrock charges.
+
+**3. Iterate.** Edit the prompt, re-run the single case, read the new judge output. Repeat until the case passes.
+
+**4. Run the smoke set (~5 cases) when the one case is happy.**
+
+```bash
+uv run python -m eval.run --smoke
+```
+
+~2 minutes. ~10 cents. Catches obvious adjacent regressions.
+
+**5. Run the full set (~30 cases) before opening the PR, and push the results to Phoenix.**
+
+```bash
+PHOENIX_PUSH=1 uv run python -m eval.run --all
+```
+
+~10 minutes. ~$1–2. With `PHOENIX_PUSH=1` the run is uploaded to Phoenix as an experiment tagged `author=sam branch=feature/yoy local=true`. Without the env var, the run prints to the terminal and disappears — useful for quick checks you don't want to clutter the dashboard with.
+
+**6. Open the PR.** Push the branch. CI takes over (5.4).
+
+That is the dev loop. Three to four runs per change, only the last one is in CI. The local single-case run is the cockpit; CI is the safety net.
+
+### 5.2 How Phoenix keeps tabs on the golden cases (datasets)
+
+Goldens live in `eval/goldens/` in the repo. **Git is the source of truth.** When a golden changes, the change is a commit.
+
+A small script (`scripts/upload_dataset.py`) syncs the on-disk goldens to a Phoenix **dataset**. Phoenix datasets are versioned automatically — every upload becomes a new dataset version, and Phoenix remembers which examples were added, changed, or removed. So if Sam adds the YoY case, the dataset goes from `golden-v1@v3` to `golden-v1@v4` in Phoenix.
+
+The sync runs:
+
+- **Locally,** when a dev wants their working-tree changes to be the dataset for the next eval run (`uv run python scripts/upload_dataset.py --tag local-sam`).
+- **In CI,** on every merge to `main`, so the canonical Phoenix dataset always reflects what's in `main`.
+
+In the Phoenix UI under **Datasets → golden-v1** you see the current example count, the schema, every historical version, and a diff between versions. Every experiment is pinned to a specific dataset version, so if a regression coincides with a dataset change, you can rule that in or out by re-running the previous version's dataset.
+
+### 5.3 How eval runs show up in the Phoenix dashboard
+
+Every eval run — local, CI, nightly — produces what Phoenix calls an **experiment**. An experiment is "a set of per-case scores plus the actual model outputs, tagged with metadata."
+
+Each experiment carries tags like:
+
+| Tag | Example value | Set by |
+|---|---|---|
+| `commit` | `abc123` | CI script reads `$GITHUB_SHA` |
+| `branch` | `main`, `feature/yoy` | CI script reads `$GITHUB_REF` |
+| `author` | `sam` | local: `$USER`; CI: PR author |
+| `environment` | `local`, `ci`, `nightly` | CI script sets explicitly |
+| `dataset_version` | `golden-v1@v4` | Phoenix sets automatically |
+| `agent_model_id` | `eu.anthropic.claude-sonnet-4-5...` | Read from the agent config |
+
+In the Phoenix UI go to **Experiments**. You see a sortable, filterable list of every run. You can:
+
+- Filter "experiments on `main` since 1 May" — the time series of how the agent has moved.
+- Filter "experiments for commit `abc123`" — everywhere that commit was scored.
+- Pick any two experiments → click **Compare** → see per-metric deltas, drill into the cases where the two runs disagree.
+- Click an experiment → see every per-case score, the model output, and the judge's reasoning.
+
+**This is the central panel.** When a teammate asks "how is the deployed agent doing?", the answer is: open Phoenix, filter experiments to `environment=nightly branch=main`, sort by date, look at the top entry. Local pre-PR runs are also visible if devs opted in with `PHOENIX_PUSH=1`.
+
+Production traffic is a separate Phoenix concept: **traces**. The deployed agent emits a trace per conversation. The online-eval Lambda (workplan M3) samples 10% of those traces every 15 minutes and writes scores back as **annotations** on the traces. So Phoenix also answers "what does the *deployed* agent score on real traffic, not just on the golden set?" — sometimes the two diverge and that divergence is the most interesting signal you have.
+
+### 5.4 How CI runs the same evals
+
+The GitHub Actions workflow (or GitLab pipeline — same shape, different yaml) does this on every PR:
+
+1. **Check out the code** at the PR's commit.
+2. **Resolve AWS credentials** via OIDC into the eval-cost-centre account.
+3. **Install dependencies** (`uv sync`).
+4. **Boot the agent in mocked mode.** `MOCK_MCP=1` substitutes a fake MCP client — no real Athena, no real Glue. Bedrock is still called for real, because the agent's reasoning and the judge's scoring are exactly what's being evaluated.
+5. **Run the goldens** (`uv run deepeval test run tests/evals/`).
+6. **Produce a report.** JSON file: `{"commit": "abc123", "scores": {...per-metric averages...}, "per_case": [...]}`.
+7. **Upload to S3** at `s3://data-analyst-agent-evals/reports/abc123/report.json`. Object versioning is on, so this report is permanent.
+8. **Upload to Phoenix** as an experiment tagged `commit=abc123 environment=ci branch=<branch>`. Visible in the experiments tab immediately.
+9. **Compare to baseline** (see 5.5).
+10. **Post a PR comment** with the comparison. Exit non-zero if the gate fails.
+
+GitHub branch protection on `main` requires "evals" to be green before the merge button activates. GitLab equivalent: "All jobs must succeed" plus a merge-request approval rule.
+
+### 5.5 The regression gate, in plain English
+
+This is the part that's new to most teams, so it's worth being precise.
+
+**The baseline.** A small file in S3 — `s3://data-analyst-agent-evals/baselines/main.json` — contains the per-metric averages from the most recent nightly run on `main`. Nothing exotic, just JSON with numbers in it. CI overwrites it on every successful merge to `main`.
+
+**The comparison.** For every PR, CI computes this PR's per-metric averages and then computes `delta = pr_score - baseline_score`. So if `tool_correctness` was 0.94 on main and is 0.91 in the PR, the delta is `-0.03` (3 percentage points down).
+
+**The decision.** Per-metric thresholds decide what each delta means. A starting policy:
+
+| Metric | Hard block | Warn | Pass |
+|---|---|---|---|
+| Critical safety cases (tagged `critical`) | any drop | — | no drop |
+| Schema grounding (deterministic) | -2pp | — | within 2pp |
+| Tool selection (deterministic + judge) | -10pp | -5pp | within 5pp |
+| Task Completion, Plan Adherence (judge) | -15pp | -5pp | within 5pp |
+| Answer Grounding (judge) | -15pp | -5pp | within 5pp |
+| Execution accuracy (result set, deterministic) | -10pp | -5pp | within 5pp |
+
+Any metric in the "block" column means CI exits non-zero and the PR cannot merge. "Warn" passes CI but the PR comment flags it for reviewer attention.
+
+These numbers are not sacred — they are a starting policy. After the first month, look at how often the gate is right versus wrong and tighten or loosen accordingly. The principle is: gates should rarely fire on legitimate work and never miss a real regression.
+
+**Worked example.** Sam's PR scores:
+
+```
+                       PR     main    delta
+tool_correctness       0.93   0.94    -0.01   PASS
+answer_grounding       0.81   0.79    +0.02   PASS
+schema_grounding       1.00   1.00     0.00   PASS
+execution_accuracy     0.87   0.85    +0.02   PASS
+task_completion        0.78   0.80    -0.02   PASS
+```
+
+All within bands. PR comment is green. Merge proceeds.
+
+A different PR — someone tightened the system prompt aggressively to reduce verbosity:
+
+```
+                       PR     main    delta
+tool_correctness       0.93   0.94    -0.01   PASS
+answer_grounding       0.62   0.79    -0.17   BLOCK
+```
+
+Answer Grounding dropped 17 percentage points — past the -15pp hard block. CI fails. The PR cannot merge. The author either fixes the prompt or, if the regression is intentional, adds an acknowledgement to the PR description:
+
+```
+eval-acknowledge: answer_grounding -0.17
+reason: prompt tightened for brevity; the cases that regressed asked
+long-form questions the new prompt deliberately punts to a follow-up
+turn. Acceptable tradeoff for the 80% of short questions.
+```
+
+CI parses this, downgrades the block to a warning, and surfaces it in the PR comment. The reviewer is now explicitly signing off on the intentional regression. The bookkeeping is permanent in the PR.
+
+**Critical cases bypass the average.** A single `critical`-tagged case flipping from 1.0 to 0.0 blocks the PR regardless of what the averages look like. These are safety-related (refusal of destructive ops, no PII in answers, no DDL on production tables). Equivalent to "you broke a security test."
+
+**Noise.** LLM-as-judge scores are non-deterministic enough that ±2pp jitter is normal. A noise floor (deltas under ±2pp count as zero) stops jitter from looking like real movement. For aggressive de-noising, run each case 3 times and use the median — triples the eval cost but removes most false positives. Defer until the gate is empirically flaky.
+
+### 5.6 Tying it together
+
+One change, end to end:
+
+1. Sam edits a prompt locally → runs one eval case in the terminal → iterates.
+2. Sam runs the full local suite (`PHOENIX_PUSH=1`) → sees scores in Phoenix → opens a PR.
+3. CI runs the same suite → uploads to S3 and Phoenix → compares to baseline → posts a PR comment → exits zero.
+4. Reviewer reads the diff and the score comparison → approves.
+5. Merge → existing deploy pipeline picks up the new container.
+6. Deployed agent emits traces to Phoenix.
+7. Online-eval Lambda samples 10% of traces, scores them, writes annotations back.
+8. The next morning the team opens Phoenix and sees: Sam's CI experiment tagged with the commit, the nightly run on main with the new baseline, and the rolling online-eval averages on production traffic.
+
+Every step is tagged with the same commit SHA. From any point — a PR, a Phoenix experiment, a deployed trace — you can pivot to the others.
+
+### 5.7 Further reading
+
+Practitioner write-ups:
+
+- Hamel Husain, *"Your AI product needs evals"* — widely cited; the case for treating evals as a first-class engineering artifact, with practical advice on dataset construction and judge prompts. https://hamel.dev/blog/posts/evals/
+- Yan, Bischof, Bhansali, Goyal, Howell, Huyen, *"What we've learned from a year of building with LLMs"* — section "Operations" covers eval practice across multiple production teams. https://applied-llms.org/
+- Anthropic, *"Building effective agents"* — recommended companion read; the agent-design choices that affect evaluability (single-agent vs multi-agent, tool design, error handling). https://www.anthropic.com/research/building-effective-agents
+
+Research:
+
+- Zheng et al., 2023, *"Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"* — the canonical reference on LLM-as-judge methodology, including position bias and agreement-with-humans measurements. https://arxiv.org/abs/2306.05685
+- Li et al., 2023, *"Can LLM Already Serve as A Database Interface? A Big Bench for Large-Scale Database Grounded Text-to-SQLs"* (BIRD) — the benchmark and methodology that establish execution accuracy on result sets as the right correctness metric for SQL-emitting agents, rather than string-matching the SQL. https://arxiv.org/abs/2305.03111
+
+Tool documentation:
+
+- Arize Phoenix, *Datasets and Experiments overview*. https://arize.com/docs/phoenix/datasets-and-experiments/overview-datasets
+- DeepEval, *Evaluation introduction*. https://deepeval.com/docs/evaluation-introduction
+- OpenInference, *Semantic conventions* — the OTel-compatible attribute schema that lets Phoenix interoperate with any agent framework. https://github.com/Arize-ai/openinference/blob/main/spec/README.md
+
+## 6. Eval methodology for this agent
 
 The published agent-eval literature (BIRD-SQL, MT-Bench, MAC-SQL) is unambiguous on three points: don't score SQL strings, do score result sets and trajectories, and don't trust a single judge.
 
@@ -167,7 +378,7 @@ Three sourcing paths, use all three:
  "judge_rubric":"Score 1.0 if agent asks a clarifying question (which time range, which product line, which region). Score 0.0 if agent guesses and queries."}
 ```
 
-## 6. Production considerations
+## 7. Production considerations
 
 - **Cost per query.** Instrument both Bedrock token cost (already in OpenInference spans) and Athena bytes-scanned (add as a span attribute in the `athena_query_to_ci_csv` tool wrapper). Expose `$/answer` as a Phoenix dashboard metric. Hard-cap with Athena workgroup data-scan limits per tenant. Bedrock budget cap via Application Inference Profiles per-tenant.
 - **Eval cost.** Run deterministic checks (result-set diff, schema grounding, tool-selection deterministic half) per-PR. Run LLM judges nightly only. Estimated ~$30/mo judge tokens at planned scale, dwarfed by ~$200-400/mo of agent inference during live eval runs. Mitigate via Bedrock prompt caching on the (large, stable) system prompt — Strands' `BedrockModel` supports the cache-breakpoint.
@@ -175,10 +386,10 @@ Three sourcing paths, use all three:
 - **Observability stack choice.** Phoenix self-hosted for prod, Phoenix in docker-compose for local dev, both speaking OpenInference so the OTel pipeline is unchanged across environments. License note: Phoenix is **Elastic License 2.0** (restricts offering it as a managed service to third parties); Langfuse core is MIT. For any future scenario where the platform is resold as a service, Langfuse is the better long-term bet — for now Phoenix's operational simplicity wins.
 - **Trace sampling in prod.** Strands tracer supports per-session sampling; default 100% in dev, head-based sampling at 10-20% in prod with full sampling on error sessions. Online evaluator Lambda runs on the sampled subset, not full traffic.
 - **PII and prompt-injection.** Strip/parameterize user input into the SQL generation prompt. Run generated SQL through an allow-listed sqlglot AST check before execution (no DDL/DML on non-`scratch_*` tables, no cross-database joins outside an allowlist). The Code Interpreter sandbox handles Python isolation but not Athena — defense-in-depth.
-- **Error handling and retry.** The existing `GlueJobRunPollThrottleHook` is the right pattern; add a similar hook for Athena query throttling. Bedrock throttle retries already in `BedrockModel`. The big missing piece is **self-correction on SQL errors** (see §7) — single biggest accuracy win available cheaply.
+- **Error handling and retry.** The existing `GlueJobRunPollThrottleHook` is the right pattern; add a similar hook for Athena query throttling. Bedrock throttle retries already in `BedrockModel`. The big missing piece is **self-correction on SQL errors** (see §8) — single biggest accuracy win available cheaply.
 - **Scaling.** ECS Fargate autoscale on session count + Bedrock throttle headroom. The sandbox pool already exists (PR #6, ECS task metadata self-discovery).
 
-## 7. Multi-agent angle
+## 8. Multi-agent angle
 
 **Honest answer: a single agent with one SQL execution-feedback loop is the right call for this project. A planner/executor/critic split is over-engineering at this scale.**
 
@@ -194,7 +405,7 @@ What the literature shows:
 
 **Where multi-agent *does* pay off and is a credible future workstream:** multi-source RAG over runbooks + structured data. A retriever-agent / analyst-agent split is legitimate when retrieval has a separate failure mode from analysis. Not today, but a credible roadmap item.
 
-## 8. Workplan
+## 9. Workplan
 
 ### M0 — Pre-work (1-2 hr)
 
@@ -322,7 +533,7 @@ What the literature shows:
 - **RAG over runbooks.** Add a `runbook_search` MCP tool backed by Bedrock Knowledge Base, eval with Ragas-style faithfulness + context-precision. ~12 hr. Unlocks the multi-agent retriever/analyst split as a credible future workstream.
 - **Production-trace-to-dataset Lambda.** Weekly job that promotes thumbs-down traces from Phoenix to `golden-vN+1`, with manual review queue. The flywheel. ~6 hr.
 
-## 9. Open questions
+## 10. Open questions
 
 Decide these before starting M1:
 
