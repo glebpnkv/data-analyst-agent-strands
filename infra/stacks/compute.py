@@ -135,6 +135,14 @@ class ComputeStack(cdk.Stack):
         sandbox_memory_mib = int(
             self.node.try_get_context("sandbox_memory_mib") or DEFAULT_SANDBOX_MEMORY_MIB
         )
+        # Phoenix desired_count is a context flag so the first-time
+        # bootstrap can deploy Compute with the service "registered but
+        # empty" (count=0), create the phoenix logical DB on RDS via
+        # `scripts/bootstrap_phoenix_db.sh`, then redeploy with the
+        # default (1) to start Phoenix against the now-existing DB.
+        # Steady-state deploys do not set this and get 1.
+        _phoenix_desired = self.node.try_get_context("phoenix_desired_count")
+        phoenix_desired_count = int(_phoenix_desired) if _phoenix_desired is not None else 1
 
         ssm_prefix = f"/data-analyst-agent/{stage.lower()}"
 
@@ -628,7 +636,10 @@ class ComputeStack(cdk.Stack):
             # Phoenix runs SQL migrations under a write lock at container
             # boot; first start can take 60-90s. Give generous grace.
             # Single replica only — concurrent boots would race the lock.
-            desired_count=1,
+            # `desired_count` is controllable via context (`phoenix_desired_count`)
+            # so the first-time bootstrap can run with 0 while the
+            # phoenix logical DB is being created on RDS.
+            desired_count=phoenix_desired_count,
             health_check_grace_period=cdk.Duration.seconds(180),
             min_healthy_percent=0,
             max_healthy_percent=100,
