@@ -2,7 +2,7 @@
 
 ## 1. TL;DR
 
-- **Primary stack (recommended): Arize Phoenix (OSS, self-hosted on ECS Fargate) for tracing + offline experiments + dataset versioning, plus DeepEval as a pure pytest metric library for CI gates.** Both speak OpenInference, both use Bedrock-Claude as judge in eu-central-1, both fit a "no outbound SaaS, minimum new infra" constraint. Phoenix is one Fargate task + a logical DB on the existing Aurora; DeepEval is a `pyproject.toml` line.
+- **Primary stack (recommended): Arize Phoenix (OSS, self-hosted on the existing ECS Ec2 cluster) for tracing + offline experiments + dataset versioning, plus DeepEval as a pure pytest metric library for CI gates.** Both speak OpenInference, both use Bedrock-Claude as judge in eu-central-1, both fit a "no outbound SaaS, minimum new infra" constraint. Phoenix is one ECS service + a logical DB on the existing RDS Postgres; DeepEval is a `pyproject.toml` line.
 - **Backup stack: AgentCore Observability + AgentCore Evaluations** if (and only if) the deployment account does not block the `bedrock-agentcore:*` namespace. It is the only AWS-native option that actually understands trajectories and tool calls, Strands is officially supported, and offline/online metric symmetry ("same metrics in CI as in production sampling") is a strong design property. Caveat: restricted environments are likely to block this namespace, so AgentCore should be treated as an additive track, not a portable foundation.
 - **Skip entirely:** old Bedrock Model Evaluation Jobs (single-turn, prompt-only, not agent-aware), SageMaker Clarify / FMEval (adds SageMaker surface for nothing AgentCore Evaluations doesn't already give you), CloudWatch Evidently (EOL Oct 2025), Langfuse self-host (5 backing services including ClickHouse-on-Fargate — operationally heavy for a small team), LangSmith / Braintrust / W&B Weave (all SaaS-first or Enterprise-self-host-only, conflict with restricted-egress postures).
 - **Highest-leverage first move:** add `openinference-instrumentation-strands-agents` to `agent_server/observability.py` so Strands' AGENT/TOOL spans pick up proper OpenInference span kinds. That single change unlocks Tool Selection / Trajectory evals in Phoenix, DeepEval, AgentCore, or any other OpenInference-aware backend adopted later. Cost: ~10 lines of code.
@@ -12,7 +12,7 @@
 | Name | Category | AWS deploy | Tracing | Datasets | LLM-judge | Versioning | Cost (dev/mo) | Fit | One-line verdict |
 |---|---|---|---|---|---|---|---|---|---|
 | **Bedrock AgentCore Evaluations** | AWS-native | Managed; needs CloudWatch Transaction Search + ADOT in-task | Consumes OTel/OpenInference via CloudWatch | JSON via `FileDatasetProvider`; predefined + simulated; SDK-versioned | ~13 built-ins incl. ToolSelectionAccuracy, TrajectoryInOrderMatch; custom LLM + Lambda | Dataset versions API; experiments per endpoint | ~$140 evals + Bedrock judge tokens | 9/10 unrestricted, blocked in restricted accounts | Best AWS-native fit if not SCP-blocked; only AWS option that understands trajectories |
-| **Arize Phoenix (OSS)** | OSS self-host | 1 Fargate task + Postgres; can reuse existing Aurora | Native OTLP, OpenInference is theirs | Versioned datasets, promote-from-trace, side-by-side experiments | `llm_classify` + `BedrockModel`; Tool Selection / Hallucination / QA evaluators | Dataset, prompt, experiment versions in OSS | ~$70-90 infra + ~$20 Bedrock judges | 9/10 | Already in docker-compose; cheapest credible OSS path; ship today |
+| **Arize Phoenix (OSS)** | OSS self-host | 1 ECS service + Postgres; can reuse existing RDS Postgres | Native OTLP, OpenInference is theirs | Versioned datasets, promote-from-trace, side-by-side experiments | `llm_classify` + `BedrockModel`; Tool Selection / Hallucination / QA evaluators | Dataset, prompt, experiment versions in OSS | ~$70-90 infra + ~$20 Bedrock judges | 9/10 | Already in docker-compose; cheapest credible OSS path; ship today |
 | **Langfuse v3 (self-host)** | OSS self-host (heavy) | 2 app containers + Postgres + Redis + ClickHouse + S3 | OTLP/OpenInference ingest | Versioned datasets + experiments | Built-in model-based eval, Bedrock supported | Prompts with labels, instant rollback, score analytics | ~$200-350 dev / $500-1000 prod | 7/10 | Better single-product story than Phoenix but ClickHouse-on-Fargate is real operational risk |
 | **LangSmith** | SaaS (or Enterprise K8s) | SaaS US-only; self-host = EKS + ClickHouse Enterprise tier | OTLP with OpenInference mapping; custom Strands exporter recommended | First-class, trace-to-dataset is strongest in the space | Trajectory evals, multi-turn evals (`agentevals` assumes LangChain msgs) | Best-in-class PromptHub + dataset versions | Free tier 5k traces, then $2.50/1k | 5/10 | Product is best-in-class; deployment fit for this project is bad (SaaS US-only, self-host is EKS-only) |
 | **Braintrust** | SaaS (Enterprise self-host) | Hybrid Terraform data-plane, **not in eu-central-1** | OTLP GenAI; OpenInference not first-class | First-class, promote-from-trace, snapshot/env | autoevals (MIT, 25 scorers) usable standalone; SaaS adds online | Strongest version-diff + PR regression gate in the space | $249/mo Pro flat; OSS scorers free | 6/10 | Adopt autoevals OSS in pytest now; skip SaaS until region story is sorted |
@@ -30,7 +30,7 @@ There are three overlapping AWS products. Only one is actually agent-aware:
 - **SageMaker Clarify FM evaluation / `fmeval`** is the same conceptual shape (prompt -> response, plus toxicity/bias/factuality benchmarks) but requires a SageMaker domain or Processing role. Strictly worse than AgentCore for this project. Skip.
 - **Bedrock AgentCore Evaluations** (GA 2026-03-31) is the only AWS-native eval product that ingests OTel + OpenInference traces and scores trajectories, tool selection, tool parameters, and session-level goal success. Strands is explicitly named as a supported framework. It ships ~13 built-in LLM-as-judge evaluators (Correctness, Faithfulness, Helpfulness, GoalSuccessRate, ToolSelectionAccuracy, ToolParameterAccuracy, TrajectoryExactOrderMatch/InOrderMatch/AnyOrderMatch, Refusal, Harmfulness, etc.), supports custom LLM-as-judge and code-based (Lambda) evaluators, and runs in on-demand / batch / online / simulation modes that all share the same evaluator set.
 
-**Sibling AgentCore building blocks:** **Observability** (CloudWatch-backed OTel ingest, prerequisite for Evaluations), **Memory** (events + extracted long-term memory — credible alternative to rolling your own), **Runtime** (Firecracker microVM per session — overlaps Fargate, skip), **Identity** (only matters for per-user OAuth to downstream tools), **Code Interpreter** (already in use; in restricted environments the AgentCore namespace is blocked and the project self-hosts the sandbox pool).
+**Sibling AgentCore building blocks:** **Observability** (CloudWatch-backed OTel ingest, prerequisite for Evaluations), **Memory** (events + extracted long-term memory — credible alternative to rolling your own), **Runtime** (Firecracker microVM per session — overlaps existing ECS service, skip), **Identity** (only matters for per-user OAuth to downstream tools), **Code Interpreter** (already in use; in restricted environments the AgentCore namespace is blocked and the project self-hosts the sandbox pool).
 
 **When to pick AgentCore Evaluations:** the deployment account is unrestricted, eu-central-1 region availability is confirmed (it launched in us-east-1, us-west-2, ap-southeast-2 first), and the goal is offline/online metric symmetry. Use built-in trajectory + tool-selection + faithfulness evaluators; add one **custom LLM-as-judge** for tabular-answer-grounding (the built-in Faithfulness prompt is generic and under-flags hallucinated row counts) and one **code-based Lambda evaluator** for deterministic SQL syntactic validity via sqlglot.
 
@@ -42,13 +42,13 @@ There are three overlapping AWS products. Only one is actually agent-aware:
 
 ### Primary recommendation: Phoenix (self-hosted) + DeepEval (pytest)
 
-**Phoenix** handles: production tracing, dataset versioning, experiments with side-by-side comparison, ad-hoc UI exploration during dev, online eval via an EventBridge-scheduled Lambda. One Fargate task on the existing ECS cluster, a second logical database on the existing Chainlit Aurora (no new RDS instance), reuses the existing OpenInference Bedrock instrumentor. Total net-new infra: one ECS task, one ALB target group, one Lambda, three Secrets Manager secrets. Cost: ~$70-90/mo + ~$20/mo Bedrock judge tokens.
+**Phoenix** handles: production tracing, dataset versioning, experiments with side-by-side comparison, ad-hoc UI exploration during dev, online eval via an EventBridge-scheduled Lambda. One ECS service on the existing Ec2-backed cluster, a second logical database on the existing Chainlit RDS Postgres (no new RDS instance), reuses the existing OpenInference Bedrock instrumentor. Total net-new infra: one ECS service, one ALB target group, one Lambda, three Secrets Manager secrets. Cost: ~$70-90/mo + ~$20/mo Bedrock judge tokens.
 
 **DeepEval** handles: pytest-native CI gates with the deepest OSS metric catalogue (ToolCorrectness, TaskCompletion, GEval, PlanAdherence). Library only — do **not** install `deepeval.integrations.strands.instrument_strands()` because it registers a competing OTel span processor aimed at Confident AI cloud and fights the OpenInference -> OTLP -> Phoenix pipeline. Judge via Claude on Bedrock through LiteLLM (more reliable structured outputs than raw boto3). Cost: $0 library + ~$90/mo judge tokens.
 
 **Why these two and not one tool:** Phoenix's eval primitives are real but Python-API-driven and have weak prompt registries; DeepEval's pytest ergonomics are the cleanest in the space for CI gates. Used together: Phoenix as the durable trace + dataset + experiment store, DeepEval as the in-process CI gate. They don't conflict — Phoenix consumes OTel spans; DeepEval is a pure metric library. Same OpenInference instrumentation feeds both.
 
-**Why not Langfuse:** functionally cleaner single-product story, but v3 self-hosting needs **five** backing services: web container + worker container + Postgres + Redis + ClickHouse + S3. ClickHouse has no managed AWS equivalent, so it runs on Fargate with EFS for persistence — that's the riskiest operational piece in this whole comparison. Realistic dev cost ~$200-350/mo; production ~$500-1000/mo. Phoenix's dev cost is ~10% of that. Pick Langfuse only if a team of 3+ engineers needs simultaneous prompt registry, annotation queues, and dashboards in one UI, with someone willing to own ClickHouse-on-Fargate.
+**Why not Langfuse:** functionally cleaner single-product story, but v3 self-hosting needs **five** backing services: web container + worker container + Postgres + Redis + ClickHouse + S3. ClickHouse has no managed AWS equivalent, so it runs as a self-managed ECS task with EFS for persistence — that's the riskiest operational piece in this whole comparison. Realistic dev cost ~$200-350/mo; production ~$500-1000/mo. Phoenix's dev cost is ~10% of that. Pick Langfuse only if a team of 3+ engineers needs simultaneous prompt registry, annotation queues, and dashboards in one UI, with someone willing to own self-managed ClickHouse.
 
 **Why not Promptfoo / Braintrust autoevals:** both are credible OSS alternatives to DeepEval for the CI half. DeepEval wins on (a) first-party Strands integration, (b) deepest agent-specific metric catalogue (PlanAdherence + StepEfficiency match the agent's explicit Phase A/B lifecycle), (c) Bedrock-native judge support. Promptfoo wins on "single YAML drives dev + CI + viewer" simplicity if a config-first eval surface is preferred. Either is defensible; pick DeepEval for the metric depth.
 
@@ -67,7 +67,7 @@ This section walks through what actually happens, in order, when someone changes
 
 **Prerequisites.** Two things must be in place before any of this works:
 
-1. **Phoenix is deployed in the AWS account** (one Fargate task, a logical database on the existing Aurora — see workplan M1).
+1. **Phoenix is deployed in the AWS account** (one ECS service, a logical database on the existing RDS Postgres — see workplan M1).
 2. **DeepEval is installed in the agent repo** as a Python library (a line in `pyproject.toml`). Nothing to deploy; it lives in the dev/CI Python environment.
 
 Everything below assumes those are done.
@@ -387,7 +387,7 @@ Three sourcing paths, use all three:
 - **Trace sampling in prod.** Strands tracer supports per-session sampling; default 100% in dev, head-based sampling at 10-20% in prod with full sampling on error sessions. Online evaluator Lambda runs on the sampled subset, not full traffic.
 - **PII and prompt-injection.** Strip/parameterize user input into the SQL generation prompt. Run generated SQL through an allow-listed sqlglot AST check before execution (no DDL/DML on non-`scratch_*` tables, no cross-database joins outside an allowlist). The Code Interpreter sandbox handles Python isolation but not Athena — defense-in-depth.
 - **Error handling and retry.** The existing `GlueJobRunPollThrottleHook` is the right pattern; add a similar hook for Athena query throttling. Bedrock throttle retries already in `BedrockModel`. The big missing piece is **self-correction on SQL errors** (see §8) — single biggest accuracy win available cheaply.
-- **Scaling.** ECS Fargate autoscale on session count + Bedrock throttle headroom. The sandbox pool already exists (PR #6, ECS task metadata self-discovery).
+- **Scaling.** ECS autoscale on session count + Bedrock throttle headroom. Multi-task agent scaling additionally requires moving session state out of in-task memory and onto the existing Postgres (see workplan M1.5). The sandbox pool already exists (PR #6, ECS task metadata self-discovery).
 
 ## 8. Multi-agent angle
 
@@ -422,7 +422,7 @@ What the literature shows:
 ### M1 — Tracing to production (4-6 hr)
 
 **Deliverables:**
-- Phoenix ECS service deployed in eu-central-1, reachable via internal ALB, persisted to a new logical database on the existing Chainlit Aurora.
+- Phoenix ECS service deployed in eu-central-1, reachable via internal ALB, persisted to a new logical database on the existing Chainlit RDS Postgres instance.
 - Strands AGENT/TOOL spans land in Phoenix with proper OpenInference span kinds.
 - Chainlit shows a "View trace" link per assistant turn.
 
@@ -432,11 +432,11 @@ What the literature shows:
 - `agent/agent.py`: add `trace_attributes={"session.id", "user.id", "agent.version", "agent.prompt_hash", "agent.model_id"}` to the Strands `Agent` constructor.
 - `infra/stacks/compute.py`: new `PhoenixService` block — `ecs.ContainerImage.from_registry("arizephoenix/phoenix:<pinned-tag>")`, 512 / 2048 MiB, ports 6006 + 4317, env from existing `db_secret` + new `PhoenixSystemSecret`.
 - `infra/stacks/network.py`: new SGs `phoenix_alb_sg`, `phoenix_task_sg`; allow `agent_task_sg` and `frontend_task_sg` -> phoenix on 443.
-- `infra/stacks/data.py`: bump Aurora `allocated_storage` from 20 -> 30 GiB; bootstrap script `scripts/bootstrap_phoenix_db.sh` to `CREATE DATABASE phoenix OWNER chainlit;`.
+- `infra/stacks/data.py`: no manual storage bump needed — the existing RDS instance already has storage auto-scaling (`max_allocated_storage=100`). Bootstrap script `scripts/bootstrap_phoenix_db.sh` runs `CREATE DATABASE phoenix OWNER chainlit;` against the RDS endpoint after deploy (RDS doesn't expose CREATE DATABASE as IaC).
 - New SSM params: `/data-analyst-agent/{stage}/phoenix/otlp-endpoint`, `/phoenix/ui-url`.
 - `frontend/`: render Phoenix trace link from `trace_id` in assistant message metadata.
 
-**AWS resources:** 1 ECS task, 1 internal ALB target group (reuse existing ALB with host-based routing if possible), 3 new Secrets Manager secrets (`PhoenixSecret`, `PhoenixAdminInitialPassword`, `PhoenixSystemApiKey`), 1 new logical database on Aurora.
+**AWS resources:** 1 ECS service, 1 internal ALB target group (reuse existing ALB with host-based routing if possible), 3 new Secrets Manager secrets (`PhoenixSecret`, `PhoenixAdminInitialPassword`, `PhoenixSystemApiKey`), 1 new logical database on the existing RDS Postgres instance.
 
 **Risks:**
 - Phoenix's BatchSpanProcessor buffers up to 30s — set `OTEL_BSP_SCHEDULE_DELAY=1000` for short-lived runs.
@@ -444,6 +444,33 @@ What the literature shows:
 - Phoenix Postgres migrations run at container boot under a write lock. Health check grace period >= 120s, single replica only.
 
 **Done when:** a Chainlit conversation produces spans in Phoenix with `openinference.span.kind` = AGENT / TOOL / LLM, and the Chainlit "View trace" link opens to the correct trace.
+
+### M1.5 — Multi-task session affinity (6-10 hr)
+
+**Why this exists.** With Phoenix in place (M1) the agent service is observable but still implicitly single-replica. `agent_server/sessions.py::SessionRegistry` holds session state in **task memory** keyed by `session_id`. The first time `desired_count` goes above 1, follow-up turns can land on a task that doesn't have the session in memory — the agent silently starts a new conversation. Sandbox claims (per-session AgentCore CI sandbox via `sandbox_pool.claim()`) have the same problem.
+
+LB-cookie stickiness on the agent ALB is **not the right fix**: the "client" of the agent ALB is the Chainlit task (one TCP connection, many user sessions), so LB-cookie stickiness would pin every user on a given Chainlit task to one agent task. Wrong shape.
+
+**Approach: move session state to the existing RDS Postgres.** Any agent task can serve any request. The ALB stays simple. No new gateway service.
+
+**Deliverables:**
+- `agent_server/sessions.py` refactored — in-memory dict becomes a cache in front of a Postgres `sessions` table. `get_or_create(session_id)` checks cache then Postgres; on every turn-end the session blob is persisted back.
+- New logical DB `agent_sessions` on the existing RDS instance. Bootstrap via the same pattern as `scripts/bootstrap_phoenix_db.sh`.
+- Table schema: `sessions(session_id UUID PRIMARY KEY, blob JSONB NOT NULL, sandbox_claim TEXT NULL, schema_version INT NOT NULL, created_at TIMESTAMPTZ, last_activity TIMESTAMPTZ, expires_at TIMESTAMPTZ)`.
+- `agent_server/sandbox_pool.py` — `claim()` writes the sandbox task ARN to the session row; `release()` reads it. Sandbox claims survive task replacement.
+- `infra/stacks/compute.py` — agent service `desired_count=2` + autoscaling policy. Health-check grace period generous enough for first-request session hydration.
+- `tests/data_analyst_agent/test_sessions.py` (new) — round-trip test: create on simulated task-A, read on simulated task-B, assert sandbox claim survives.
+
+**Side benefit for eval work:** the online-eval Lambda (M3) can read session context directly from Postgres rather than round-tripping through the agent HTTP API.
+
+**Risks:**
+- Session blob shape changes between agent versions during a rolling deploy — `schema_version` column gates loading; blue-green deploy avoids the edge.
+- Sandbox claim row is a hot row — index on `last_activity`, mind vacuum settings.
+- Postgres CPU on the existing `t4g.micro`. Phoenix + Chainlit + agent sessions on one instance is fine for dev volume; flag for upgrade to `t4g.small` when production traffic arrives.
+
+**Does not block M2-M5.** The eval work runs fine against a single-replica agent. M1.5 gates going to production with `desired_count > 1`.
+
+**Done when:** with `desired_count=2`, sending two turns of the same `session_id` to the ALB and forcing them to different tasks results in the agent picking up the prior context on the second turn and releasing the right sandbox on session end.
 
 ### M2 — Eval foundation (8-12 hr)
 
@@ -541,4 +568,4 @@ Decide these before starting M1:
 2. **One ALB or two?** Reuse the existing Chainlit ALB with host-based routing for `phoenix.<domain>` (saves ~$16/mo and one resource) versus a dedicated internal ALB for Phoenix (cleaner SG topology, easier to remove later). Recommend reuse.
 3. **Judge model default — Haiku 3.5 or Nova Pro?** Haiku is the safe default and what the literature mostly uses. Nova Pro is ~2× cheaper and available in eu-central-1. Worth a 50-case bake-off in M3 to see if Nova-judged scores correlate ≥ 0.9 with Haiku-judged on the goldens. If yes, switch and halve the judge bill.
 4. **Hermetic mocking strategy for MCP servers in CI.** `vcrpy`-style cassettes on `botocore` versus a hand-written `FakeMCPClient`. Cassettes capture real responses (less divergence from prod) but get stale. FakeMCPClient is more work but more controllable. Recommend FakeMCPClient for tool-call shape testing, cassettes only for the 5 nightly live cases.
-5. **Trace retention.** Default 14-day CloudWatch + 14-day Phoenix DB. If a longer retention requirement applies in production, the Aurora size estimate in M1 needs to grow. Confirm with platform.
+5. **Trace retention.** Default 14-day CloudWatch + 14-day Phoenix DB. If a longer retention requirement applies in production, the RDS instance size and storage ceiling assumptions in M1 need to grow. Confirm with platform.
