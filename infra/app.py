@@ -129,6 +129,8 @@ def main() -> None:
         frontend_alb_sg=network.frontend_alb_sg,
         frontend_task_sg=network.frontend_task_sg,
         sandbox_task_sg=network.sandbox_task_sg,
+        phoenix_alb_sg=network.phoenix_alb_sg,
+        phoenix_task_sg=network.phoenix_task_sg,
         agent_repo=ecr_stack.agent_repo,
         frontend_repo=ecr_stack.frontend_repo,
         sandbox_repo=ecr_stack.sandbox_repo,

@@ -60,6 +60,7 @@ from stacks.network import (  # noqa: F401  (reused symbols)
     ALB_HTTP_PORT,
     ALB_HTTPS_PORT,
     FRONTEND_HTTP_PORT,
+    PHOENIX_HTTP_PORT,
     SANDBOX_HTTP_PORT,
 )
 
@@ -70,6 +71,16 @@ AGENT_TASK_CPU = 512  # 0.5 vCPU
 AGENT_TASK_MEMORY_MIB = 1024  # 1 GB
 FRONTEND_TASK_CPU = 256  # 0.25 vCPU
 FRONTEND_TASK_MEMORY_MIB = 512  # 0.5 GB
+PHOENIX_TASK_CPU = 512  # 0.5 vCPU
+PHOENIX_TASK_MEMORY_MIB = 2048  # 2 GB
+
+# Phoenix container tag. Pinned for reproducibility; bump deliberately
+# after reading the release notes — Phoenix's storage schema migrates
+# at container boot under a write lock, so a rollback isn't free.
+# Verify the latest tag at https://hub.docker.com/r/arizephoenix/phoenix/tags
+# before bumping.
+PHOENIX_IMAGE_TAG = "11.4.0"
+PHOENIX_DATABASE_NAME = "phoenix"  # logical DB on the existing RDS instance
 
 # Defaults if cdk.json doesn't override; bound the runtime within
 # small-dev-friendly ranges. Per-deploy override via `cdk deploy --context key=value`.
@@ -94,6 +105,8 @@ class ComputeStack(cdk.Stack):
         frontend_alb_sg: ec2.ISecurityGroup,
         frontend_task_sg: ec2.ISecurityGroup,
         sandbox_task_sg: ec2.ISecurityGroup,
+        phoenix_alb_sg: ec2.ISecurityGroup,
+        phoenix_task_sg: ec2.ISecurityGroup,
         agent_repo: ecr.IRepository,
         frontend_repo: ecr.IRepository,
         sandbox_repo: ecr.IRepository,
@@ -501,6 +514,149 @@ class ComputeStack(cdk.Stack):
         self.github_pat_secret.grant_read(agent_task_role)
 
         # =====================================================================
+        # PHOENIX: task role, task def, ALB, service
+        # =====================================================================
+        # Self-hosted Arize Phoenix for tracing + offline experiments +
+        # dataset versioning. One container, persisted to a logical DB
+        # on the existing RDS instance (`PHOENIX_DATABASE_NAME`, created
+        # post-deploy via `scripts/bootstrap_phoenix_db.sh` — RDS doesn't
+        # expose CREATE DATABASE as IaC).
+        #
+        # Built BEFORE the agent task def so the agent's OTLP env vars
+        # can reference `self.phoenix_alb.load_balancer_dns_name`.
+        #
+        # Auth is OFF for the initial deploy. Access during dev is via
+        # `aws ssm start-session ... AWS-StartPortForwardingSessionToRemoteHost`
+        # to the Phoenix ALB DNS. Cognito-fronted public UI is a
+        # separate follow-up.
+        phoenix_task_role = iam.Role(
+            self,
+            "PhoenixTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            description="Runtime role for the Phoenix observability ECS task",
+        )
+        db_secret.grant_read(phoenix_task_role)
+
+        phoenix_log_group = logs.LogGroup(
+            self,
+            "PhoenixLogGroup",
+            log_group_name=f"/ecs/data-analyst-agent/{stage.lower()}/phoenix",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+        phoenix_task_def = ecs.Ec2TaskDefinition(
+            self,
+            "PhoenixTaskDef",
+            task_role=phoenix_task_role,
+            network_mode=ecs.NetworkMode.AWS_VPC,
+        )
+
+        phoenix_task_def.add_container(
+            "phoenix",
+            container_name="phoenix",
+            # Pinned tag in PHOENIX_IMAGE_TAG. Bump deliberately —
+            # storage migrations run under a write lock at boot.
+            image=ecs.ContainerImage.from_registry(f"arizephoenix/phoenix:{PHOENIX_IMAGE_TAG}"),
+            cpu=PHOENIX_TASK_CPU,
+            memory_limit_mib=PHOENIX_TASK_MEMORY_MIB,
+            essential=True,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="phoenix",
+                log_group=phoenix_log_group,
+            ),
+            port_mappings=[
+                ecs.PortMapping(container_port=PHOENIX_HTTP_PORT, protocol=ecs.Protocol.TCP),
+            ],
+            environment={
+                # Phoenix bundles UI + OTLP/HTTP ingest at /v1/traces on
+                # one port. We don't use the gRPC OTLP port (4317) — the
+                # ALB stays simple as HTTP-only.
+                "PHOENIX_PORT": str(PHOENIX_HTTP_PORT),
+                "PHOENIX_HOST": "0.0.0.0",
+                "PHOENIX_POSTGRES_DB": PHOENIX_DATABASE_NAME,
+                # Working dir is for transient artifacts only; durable
+                # state goes to Postgres. /tmp is writable in the
+                # arizephoenix container without extra volumes.
+                "PHOENIX_WORKING_DIR": "/tmp/phoenix",
+                # Suppress the first-run telemetry prompt.
+                "PHOENIX_ENABLE_PROMETHEUS": "false",
+            },
+            secrets={
+                # The RDS-generated secret stores credentials as JSON;
+                # we lift individual fields with `field=`. Phoenix accepts
+                # these env vars and constructs its SQLAlchemy URL itself.
+                "PHOENIX_POSTGRES_HOST": ecs.Secret.from_secrets_manager(
+                    db_secret, field="host"
+                ),
+                "PHOENIX_POSTGRES_PORT": ecs.Secret.from_secrets_manager(
+                    db_secret, field="port"
+                ),
+                "PHOENIX_POSTGRES_USER": ecs.Secret.from_secrets_manager(
+                    db_secret, field="username"
+                ),
+                "PHOENIX_POSTGRES_PASSWORD": ecs.Secret.from_secrets_manager(
+                    db_secret, field="password"
+                ),
+            },
+        )
+
+        self.phoenix_alb = elbv2.ApplicationLoadBalancer(
+            self,
+            "PhoenixAlb",
+            vpc=vpc,
+            internet_facing=False,
+            security_group=phoenix_alb_sg,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            idle_timeout=cdk.Duration.seconds(120),
+        )
+
+        phoenix_listener = self.phoenix_alb.add_listener(
+            "PhoenixListener",
+            port=ALB_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            open=False,
+        )
+
+        self.phoenix_service = ecs.Ec2Service(
+            self,
+            "PhoenixService",
+            cluster=self.cluster,
+            task_definition=phoenix_task_def,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            security_groups=[phoenix_task_sg],
+            # Phoenix runs SQL migrations under a write lock at container
+            # boot; first start can take 60-90s. Give generous grace.
+            # Single replica only — concurrent boots would race the lock.
+            desired_count=1,
+            health_check_grace_period=cdk.Duration.seconds(180),
+            min_healthy_percent=0,
+            max_healthy_percent=100,
+            enable_execute_command=True,
+        )
+
+        phoenix_listener.add_targets(
+            "PhoenixTargets",
+            port=PHOENIX_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            targets=[self.phoenix_service],
+            health_check=elbv2.HealthCheck(
+                # Phoenix returns 200 on `/healthz` once migrations
+                # have completed and the server is accepting traffic.
+                path="/healthz",
+                healthy_http_codes="200",
+                # First-boot migrations can take ~60s. Stretch the
+                # threshold so the target group doesn't flap during
+                # rolling deploys.
+                interval=cdk.Duration.seconds(30),
+                timeout=cdk.Duration.seconds(10),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=5,
+            ),
+            deregistration_delay=cdk.Duration.seconds(15),
+        )
+
+        # =====================================================================
         # AGENT TASK DEF + ECS SERVICE (Ec2 launch type)
         # =====================================================================
         agent_log_group = logs.LogGroup(
@@ -562,6 +718,26 @@ class ComputeStack(cdk.Stack):
                 "SANDBOX_POOL_SIZE": str(sandbox_pool_size),
                 "SANDBOX_PORT": str(SANDBOX_HTTP_PORT),
                 "SANDBOX_CONTAINER_NAME": SANDBOX_CONTAINER_NAME,
+                # ----- Phoenix / OTel wiring -----
+                # Strands' setup_otlp_exporter() reads the standard
+                # OTEL_* vars. http/protobuf because Phoenix takes OTLP
+                # over HTTP at /v1/traces on its UI port — no separate
+                # gRPC port needed.
+                "AGENT_OTLP_ENABLE": "1",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": (
+                    f"http://{self.phoenix_alb.load_balancer_dns_name}"
+                ),
+                # 5s default flush is too laggy for snappy "View trace"
+                # demos; 1s keeps traces appearing while still batching.
+                "OTEL_BSP_SCHEDULE_DELAY": "1000",
+                # Identifies the build in every span attribute.
+                # `agent_version` context is set by deploy_agent.sh from
+                # `git rev-parse --short HEAD`; fallback to "deployed"
+                # when not provided so we never emit empty.
+                "AGENT_VERSION": (
+                    self.node.try_get_context("agent_version") or "deployed"
+                ),
             },
             secrets={
                 "AGENT_SERVICE_AUTH_SECRET": ecs.Secret.from_secrets_manager(self.service_auth_secret),
@@ -854,6 +1030,33 @@ class ComputeStack(cdk.Stack):
             "SandboxPortParam",
             parameter_name=f"{ssm_prefix}/sandbox/port",
             string_value=str(SANDBOX_HTTP_PORT),
+        )
+
+        # Phoenix params: dev laptop uses these for SSM port-forwarding
+        # to the internal Phoenix ALB during eval / debugging sessions.
+        ssm.StringParameter(
+            self,
+            "PhoenixServiceNameParam",
+            parameter_name=f"{ssm_prefix}/phoenix/service-name",
+            string_value=self.phoenix_service.service_name,
+        )
+        ssm.StringParameter(
+            self,
+            "PhoenixAlbDnsParam",
+            parameter_name=f"{ssm_prefix}/phoenix/alb-dns",
+            string_value=self.phoenix_alb.load_balancer_dns_name,
+        )
+        ssm.StringParameter(
+            self,
+            "PhoenixUiUrlParam",
+            parameter_name=f"{ssm_prefix}/phoenix/ui-url",
+            string_value=f"http://{self.phoenix_alb.load_balancer_dns_name}",
+        )
+        ssm.StringParameter(
+            self,
+            "PhoenixOtlpEndpointParam",
+            parameter_name=f"{ssm_prefix}/phoenix/otlp-endpoint",
+            string_value=f"http://{self.phoenix_alb.load_balancer_dns_name}",
         )
 
         # Top-level convenience output: public HTTPS URL behind Cognito.

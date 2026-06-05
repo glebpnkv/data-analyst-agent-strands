@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import uuid
@@ -15,6 +16,15 @@ from sandbox_client import RemoteSandboxCodeInterpreter
 from utils.hooks import GlueJobRunPollThrottleHook
 from utils.prompts import SYSTEM_PROMPT
 from utils.tools import make_athena_query_to_ci_csv, make_glue_job_run_diagnostics_tool
+
+# Trace attributes baked onto every Agent span. Lets a deployed trace
+# pivot back to a specific commit / prompt revision / model:
+#   - AGENT_VERSION   build-time git SHA, injected via env on the ECS task
+#   - AGENT_PROMPT_HASH  sha256 of the assembled system prompt (computed)
+#   - AGENT_MODEL_ID  Bedrock model ID at deploy time
+# Read at make_agent() time. session.id / user.id are filled in
+# per-request by the FastAPI layer via OTel context (see agent_server).
+_AGENT_VERSION = os.environ.get("AGENT_VERSION", "local-dev")
 
 ALLOWED_MCP_TOOLS = [
     "manage_aws_athena_databases_and_tables",
@@ -428,11 +438,23 @@ def make_agent(
     )
     tools.append(glue_job_run_diagnostics)
 
+    system_prompt = "\n\n".join(prompt_parts)
+    # Stable hash so the same prompt across deploys is identifiable in
+    # traces / eval reports without storing the prompt itself.
+    prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:16]
+
     agent_kwargs = {
         "model": model,
         "tools": tools,
-        "system_prompt": "\n\n".join(prompt_parts),
+        "system_prompt": system_prompt,
         "hooks": hooks,
+        # Baked into every span emitted by this Agent instance. Phoenix /
+        # any OpenInference-aware backend can filter or group by these.
+        "trace_attributes": {
+            "agent.version": _AGENT_VERSION,
+            "agent.prompt_hash": prompt_hash,
+            "agent.model_id": model_id,
+        },
     }
     if skills_plugin is not None:
         agent_kwargs["plugins"] = [skills_plugin]

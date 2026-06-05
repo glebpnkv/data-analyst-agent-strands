@@ -29,6 +29,12 @@ COPY frontend /app/frontend
 # still works.
 COPY scripts/local_stack/chainlit_schema.sql /app/chainlit_schema.sql
 
+# One-shot bootstrap script that creates the Phoenix logical DB on the
+# shared RDS instance. Runs out-of-band via
+# `aws ecs execute-command ... -- python /app/bootstrap_phoenix_db.py`
+# after the first Compute deploy. Idempotent.
+COPY scripts/bootstrap_phoenix_db.py /app/bootstrap_phoenix_db.py
+
 EXPOSE 8000
 
 # entrypoint.py reads DB_SECRET_ARN from env, fetches DB credentials

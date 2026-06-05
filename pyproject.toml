@@ -21,6 +21,8 @@ dependencies = [
 
     # Observability
     "openinference-instrumentation-bedrock>=0.1.35",
+    "openinference-instrumentation-strands-agents>=0.1.2",
+    "arize-phoenix-otel>=0.13.0",
 
     # FastAPI agent service
     "fastapi>=0.115.0",

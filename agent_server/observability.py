@@ -9,19 +9,32 @@ What you get out of the box:
     server.log             — duplicate of stdout, useful for `tail -f`
     strands_traces.jsonl   — Strands' OpenTelemetry spans, one JSON per line
 
-Optional OTLP export (Langfuse, Phoenix, Jaeger, anything OTel-shaped)
+Optional OTLP export (Phoenix, Langfuse, Jaeger, anything OTel-shaped)
 turns on automatically when `OTEL_EXPORTER_OTLP_ENDPOINT` is set —
 Strands' own `setup_otlp_exporter()` reads the standard `OTEL_*`
-environment variables. Example for Langfuse Cloud:
+environment variables. When OTLP is on, two instrumentors are also
+installed:
 
-    export OTEL_EXPORTER_OTLP_ENDPOINT=https://cloud.langfuse.com/api/public/otel
-    export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(public:secret)>"
+  - OpenInference Bedrock instrumentor → wraps boto3 bedrock-runtime
+    calls so LLM child spans carry token counts and per-call cost.
+  - OpenInference Strands Agents instrumentor → rewrites Strands' own
+    AGENT / TOOL spans into OpenInference span kinds so Phoenix's
+    trajectory view, Tool Selection evaluators, and AgentCore-style
+    trajectory metrics work out of the box.
+
+Example for Phoenix (self-hosted internal ALB inside the same VPC):
+
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://<phoenix-alb-dns>
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
     export AGENT_OTLP_ENABLE=1
 
 Env vars consumed here:
 - AGENT_LOG_LEVEL          — default "INFO"
 - AGENT_RUN_DIR            — default "runs"; can be relative or absolute
 - AGENT_OTLP_ENABLE        — "1" / "true" / "yes" to enable OTLP export
+- OTEL_BSP_SCHEDULE_DELAY  — BatchSpanProcessor flush interval (ms);
+                              set to 1000 in deployed agent for snappy
+                              trace appearance, default 5000 in OTel SDK
 """
 
 import logging
@@ -144,10 +157,19 @@ def _setup_strands_telemetry(run_dir: Path) -> IO[str] | None:
         # but Phoenix's token/cost UI is built around OpenInference
         # (llm.token_count.*, llm.model_name). The Bedrock instrumentor
         # patches boto3 bedrock-runtime calls and emits OpenInference-
-        # conformant child spans nested inside Strands' parents — best of
-        # both worlds: agent-level structure from Strands + per-LLM-call
-        # token/cost detail from OpenInference.
+        # conformant child spans nested inside Strands' parents.
+        #
+        # The Strands instrumentor on top rewrites the *parent* spans
+        # (the AGENT / TOOL / per-cycle spans Strands emits) into
+        # OpenInference span-kind form (openinference.span.kind=AGENT/TOOL/LLM).
+        # Without it Phoenix shows the trace as a wall of generic spans;
+        # with it Phoenix renders the agent trajectory tree natively and
+        # Tool Selection / Trajectory evaluators can read the right
+        # attributes. Order matters: instrument Bedrock first, then
+        # Strands — the Strands wrapper assumes Bedrock spans already
+        # carry their OpenInference attributes.
         _instrument_bedrock_for_openinference()
+        _instrument_strands_for_openinference()
 
     telemetry.setup_meter(
         enable_console_exporter=False,
@@ -174,6 +196,32 @@ def _instrument_bedrock_for_openinference() -> None:
         log.info("OpenInference Bedrock instrumentation enabled (Phoenix will show tokens + cost)")
     except Exception as e:
         log.warning("OpenInference Bedrock instrumentation failed: %s", e)
+
+
+def _instrument_strands_for_openinference() -> None:
+    """Rewrite Strands' own AGENT / TOOL spans into OpenInference span-kind form.
+
+    Without this, Phoenix can ingest the spans but treats them as
+    generic — the trajectory tree, tool-selection evaluators, and
+    AgentCore-shaped metrics all key off `openinference.span.kind` which
+    Strands doesn't emit natively.
+    """
+    try:
+        from openinference.instrumentation.strands import StrandsAgentsInstrumentor
+    except Exception as e:
+        log.debug("openinference-instrumentation-strands-agents not installed: %s", e)
+        return
+
+    instrumentor = StrandsAgentsInstrumentor()
+    if instrumentor.is_instrumented_by_opentelemetry:
+        log.debug("Strands Agents instrumentor already installed")
+        return
+
+    try:
+        instrumentor.instrument()
+        log.info("OpenInference Strands Agents instrumentation enabled (AGENT/TOOL span kinds)")
+    except Exception as e:
+        log.warning("OpenInference Strands Agents instrumentation failed: %s", e)
 
 
 def _otlp_enabled() -> bool:
