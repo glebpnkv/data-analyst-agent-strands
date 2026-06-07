@@ -7,7 +7,14 @@ from typing import Optional
 
 import boto3
 from mcp import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamable_http_client
+# mcp 1.27 split the streamable-HTTP entrypoint into two functions:
+#   - streamablehttp_client(url, headers=..., auth=...) ← what we want
+#   - streamable_http_client(url, http_client=..., terminate_on_close=...)
+#     ← the same NAME we used before the split but no longer accepts
+#     `headers`, hence the TypeError seen at session-creation time.
+# Stay on the canonical name so we can keep passing the bearer token
+# via headers without juggling httpx.Auth instances.
+from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent, AgentSkills
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
@@ -240,7 +247,7 @@ def make_github_mcp_client() -> MCPClient:
     headers = {"Authorization": f"Bearer {pat}"}
 
     return MCPClient(
-        lambda: streamable_http_client(
+        lambda: streamablehttp_client(
             url=GITHUB_MCP_SERVER_URL,
             headers=headers,
         ),
