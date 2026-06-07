@@ -77,9 +77,10 @@ PHOENIX_TASK_MEMORY_MIB = 2048  # 2 GB
 # Phoenix container tag. Pinned for reproducibility; bump deliberately
 # after reading the release notes — Phoenix's storage schema migrates
 # at container boot under a write lock, so a rollback isn't free.
-# Verify the latest tag at https://hub.docker.com/r/arizephoenix/phoenix/tags
-# before bumping.
-PHOENIX_IMAGE_TAG = "11.4.0"
+# Phoenix's Docker Hub tag convention is "version-X.Y.Z", NOT bare
+# semver. Verify the available tags at
+# https://hub.docker.com/r/arizephoenix/phoenix/tags before bumping.
+PHOENIX_IMAGE_TAG = "version-11.4.0"
 PHOENIX_DATABASE_NAME = "phoenix"  # logical DB on the existing RDS instance
 
 # Defaults if cdk.json doesn't override; bound the runtime within
