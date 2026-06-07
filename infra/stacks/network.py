@@ -210,6 +210,11 @@ class NetworkStack(cdk.Stack):
         # Phoenix wiring. The trust path mirrors the agent ALB:
         #   agent_task --[ALB_HTTP_PORT=80]--> phoenix_alb_sg     (OTLP)
         #   frontend_task --[ALB_HTTP_PORT=80]--> phoenix_alb_sg  (UI deep links)
+        #   any VPC-internal source --[ALB_HTTP_PORT=80]--> phoenix_alb_sg
+        #       (covers SSM port-forward sessions through ECS EC2 hosts,
+        #        which run with the ASG's auto-created SG that we don't
+        #        otherwise enumerate. ALB is internal-only — the VPC is
+        #        already the security boundary.)
         #   phoenix_alb_sg --[PHOENIX_HTTP_PORT=6006]--> phoenix_task_sg
         #   phoenix_task_sg --[POSTGRES_PORT=5432]--> rds_sg
         self.phoenix_alb_sg.add_ingress_rule(
@@ -221,6 +226,11 @@ class NetworkStack(cdk.Stack):
             peer=self.frontend_task_sg,
             connection=ec2.Port.tcp(ALB_HTTP_PORT),
             description="Frontend tasks reach Phoenix UI for deep-link rendering",
+        )
+        self.phoenix_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Dev: VPC-internal sources reach Phoenix UI (SSM port-forward via ECS EC2 hosts)",
         )
         self.phoenix_task_sg.add_ingress_rule(
             peer=self.phoenix_alb_sg,
