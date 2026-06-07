@@ -68,15 +68,31 @@ echo "==> Using frontend task: ${TASK_ARN}"
 echo "==> Running CREATE DATABASE phoenix via execute-command (idempotent)…"
 
 # `aws ecs execute-command` needs the Session Manager plugin installed
-# locally; it will print a clear error if missing. Output streams back
-# to this shell so we see CREATE DATABASE / "already exists" messages.
-aws ecs execute-command \
+# locally; it will print a clear error if missing. The container uses
+# uv-managed deps (boto3, asyncpg, sqlalchemy live in /app/.venv, not
+# on the system python), so we invoke via `uv run --no-dev --frozen`
+# to match the entrypoint.py pattern.
+#
+# A second wrinkle: `aws ecs execute-command` returns 0 whenever the
+# SSM session opens cleanly, *even if the embedded command exits
+# non-zero*. To fail loud on the actual python exit code, we wrap in
+# a shell that prints a sentinel on success and we grep for it after.
+SENTINEL="PHOENIX_BOOTSTRAP_OK_$$"
+OUTPUT=$(aws ecs execute-command \
   --region "${REGION}" \
   --cluster "${CLUSTER_NAME}" \
   --task "${TASK_ARN}" \
   --container frontend \
   --interactive \
-  --command "python /app/bootstrap_phoenix_db.py"
+  --command "sh -c 'uv run --no-dev --frozen python /app/bootstrap_phoenix_db.py && echo ${SENTINEL}'" 2>&1)
+echo "${OUTPUT}"
+
+if ! echo "${OUTPUT}" | grep -q "${SENTINEL}"; then
+  echo
+  echo "ERROR: Phoenix DB bootstrap did not complete cleanly." >&2
+  echo "       Sentinel '${SENTINEL}' not found in execute-command output." >&2
+  exit 1
+fi
 
 echo
 echo "[OK] Phoenix DB bootstrap complete. The Phoenix service can now finish migrations."
