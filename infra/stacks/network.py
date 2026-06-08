@@ -194,6 +194,19 @@ class NetworkStack(cdk.Stack):
             description="Agent ALB to agent tasks",
         )
 
+        # Dev: VPC-internal sources reach the agent ALB. Mirrors the
+        # Phoenix ALB rule — covers the SSM port-forward path through
+        # ECS EC2 hosts (used by the eval runner and ad-hoc curl
+        # against /v1/chat). Agent ALB is internal-only (private
+        # subnets, internet_facing=False); the VPC is the network
+        # boundary, and X-Service-Auth is the app-layer authn that
+        # protects /v1/chat regardless of who can open a TCP socket.
+        self.agent_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Dev: VPC-internal sources reach agent ALB (SSM port-forward via ECS EC2 hosts)",
+        )
+
         # Sandbox tasks accept HTTP only from agent tasks (no ALB).
         self.sandbox_task_sg.add_ingress_rule(
             peer=self.agent_task_sg,
