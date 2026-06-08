@@ -414,6 +414,16 @@ class ComputeStack(cdk.Stack):
         # Sandbox lifecycle. Replaces the old AgentCore Code Interpreter
         # block — that namespace is blocked at work, so we run sandboxes
         # ourselves via `ecs:RunTask`.
+        #
+        # ListTasks resources are subtle: ECS authorises ListTasks against
+        # whatever scope you pass on the request. The pool's RunTask path
+        # scopes by task-definition family (resource form `task-definition/<family>:*`),
+        # while the orphan-sweep path scopes by container-instance
+        # (resource form `container-instance/<cluster>/<instance>`). The
+        # latter was missing from the original policy, so the sweep was
+        # failing silently with AccessDeniedException and stranded
+        # sandboxes from prior sessions accumulated until the cluster
+        # ran out of memory.
         agent_task_role.add_to_policy(
             iam.PolicyStatement(
                 sid="SandboxEcsLifecycle",
@@ -430,6 +440,11 @@ class ComputeStack(cdk.Stack):
                     # All running tasks under this cluster (the pool's
                     # ListTasks call narrows to the family at the API level).
                     f"arn:aws:ecs:{self.region}:{self.account}:task/{self.cluster.cluster_name}/*",
+                    # All container instances under this cluster. The
+                    # orphan-sweep ListTasks call filters by
+                    # containerInstance ARN; without this entry that
+                    # filter is denied and the sweep can't run.
+                    f"arn:aws:ecs:{self.region}:{self.account}:container-instance/{self.cluster.cluster_name}/*",
                     # Cluster ARN itself, for ListTasks scoping.
                     self.cluster.cluster_arn,
                 ],
