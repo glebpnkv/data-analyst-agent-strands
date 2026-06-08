@@ -304,6 +304,17 @@ class NetworkStack(cdk.Stack):
             connection=ec2.Port.tcp(ALB_HTTP_PORT),
             description="Gateway ALB to gateway (HAProxy) tasks",
         )
+        # ALB target health check hits HAProxy's stats listener on
+        # 8404 (which serves /healthz). Without this rule the check
+        # times out and ECS kills the task in a loop — first deploy
+        # symptom is GatewayService/Service stuck in CREATE_IN_PROGRESS
+        # with "target ... unhealthy due to (reason Request timed out)"
+        # in the service events.
+        self.gateway_task_sg.add_ingress_rule(
+            peer=self.gateway_alb_sg,
+            connection=ec2.Port.tcp(8404),
+            description="Gateway ALB to gateway tasks (HAProxy stats + /healthz)",
+        )
         self.agent_task_sg.add_ingress_rule(
             peer=self.gateway_task_sg,
             connection=ec2.Port.tcp(AGENT_HTTP_PORT),
