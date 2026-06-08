@@ -86,12 +86,14 @@ PHOENIX_DATABASE_NAME = "phoenix"  # logical DB on the existing RDS instance
 # Defaults if cdk.json doesn't override; bound the runtime within
 # small-dev-friendly ranges. Per-deploy override via `cdk deploy --context key=value`.
 DEFAULT_ASG_INSTANCE_TYPE = "t3.medium"
-# Bumped from 2 -> 3 after M1 added the Phoenix service. Memory budget
-# across two t3.medium instances (~8 GiB ECS-allocatable) is now tight
-# enough that the sandbox pool's per-task RunTask requests get rejected
-# with RESOURCE:MEMORY. Three instances (~11.7 GiB) covers Phoenix 2 GiB
-# + Agent 1 GiB + Frontend 0.5 GiB + 2 × Sandbox 3 GiB + headroom.
-DEFAULT_ASG_MIN = 3
+# 4-instance design: 1 instance for agent+frontend, 1 for Phoenix
+# (added M1), 1 for the warm sandbox, 1 for headroom so the pool can
+# refill while a session has a sandbox claimed. Three instances would
+# leave nowhere for pool refill to land — and ECS managed scaling
+# doesn't kick in on synchronous RunTask RESOURCE:MEMORY failures.
+# cdk.json overrides this with the same value; the code default keeps
+# things sane if cdk.json is bypassed (CI synth from a clean tree, etc.).
+DEFAULT_ASG_MIN = 4
 DEFAULT_ASG_MAX = 8
 DEFAULT_SANDBOX_POOL_SIZE = 2
 DEFAULT_SANDBOX_CPU = 1024  # 1 vCPU
