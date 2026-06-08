@@ -120,9 +120,18 @@ def create_app(
 
     @app.post("/v1/chat")
     async def chat(req: ChatRequest, request: Request) -> EventSourceResponse:
+        # Session id can be passed either as the X-Session-Id header
+        # (preferred — the session-affinity gateway routes on this header
+        # without needing to parse the body) or as `session_id` in the
+        # JSON body (legacy / direct-to-agent path; still supported so
+        # the agent works the same whether or not a gateway is in front).
+        # The header wins if both are set.
+        header_sid = request.headers.get("x-session-id") or None
+        effective_sid = header_sid or req.session_id
+
         registry: SessionRegistry = request.app.state.registry
         try:
-            session = await registry.get_or_create(req.session_id)
+            session = await registry.get_or_create(effective_sid)
         except Exception as e:
             log.exception("failed to create session")
             raise HTTPException(

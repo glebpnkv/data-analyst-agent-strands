@@ -105,7 +105,13 @@ class DeployedAgentClient:
         if not session_id:
             return
         url = f"{self.base_url}/v1/sessions/{session_id}"
-        headers = {"X-Service-Auth": self.service_auth_secret}
+        headers = {
+            "X-Service-Auth": self.service_auth_secret,
+            # So the gateway routes the DELETE to the same task that
+            # owns the session (otherwise we'd ask a different task to
+            # close a session it doesn't have, which 404s silently).
+            "X-Session-Id": session_id,
+        }
         try:
             with httpx.Client(timeout=30.0) as client:
                 client.delete(url, headers=headers)
@@ -122,6 +128,10 @@ class DeployedAgentClient:
             "X-Service-Auth": self.service_auth_secret,
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
+            # Header lets the session-affinity gateway route on it
+            # without parsing the body. Agent reads it and prefers it
+            # over the body field when both are present.
+            "X-Session-Id": sid,
         }
         payload = {"session_id": sid, "prompt": prompt}
 

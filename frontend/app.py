@@ -144,7 +144,15 @@ async def on_message(message: cl.Message) -> None:
     cl.user_session.set("agent_session_id", session_id)
 
     body = {"session_id": session_id, "prompt": message.content}
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        # X-Session-Id duplicates body.session_id but lets the session-
+        # affinity gateway in front of the agent service route on header
+        # alone (no body inspection). When the gateway isn't in front
+        # the agent reads it and prefers it over the body field.
+        "X-Session-Id": session_id,
+    }
     if AGENT_SERVICE_AUTH_SECRET:
         headers["X-Service-Auth"] = AGENT_SERVICE_AUTH_SECRET
 
