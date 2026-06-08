@@ -83,6 +83,7 @@ def main() -> int:
     phoenix_client = _phoenix_client()
 
     dataset = _load_dataset_or_exit(phoenix_client, args.dataset)
+    _shim_node_id_onto_examples(dataset)
     log.info(
         "Phoenix dataset %r resolved (id=%s, %d example(s))",
         args.dataset,
@@ -172,6 +173,27 @@ def _load_dataset_or_exit(client, name: str):
             e,
         )
         sys.exit(2)
+
+
+def _shim_node_id_onto_examples(dataset) -> None:
+    """Work around Phoenix client/server version skew.
+
+    Phoenix client 2.x's experiment runner reads `example["node_id"]`
+    when posting each task run; the field was added server-side in
+    Phoenix ~14. Our deployed Phoenix is 11.4 and returns examples with
+    `id` only — but that `id` IS the GraphQL global ID (the value the
+    newer server populates `node_id` with). So copy id → node_id on
+    each example in place. Drop this shim when the Phoenix server is
+    bumped past v14.
+    """
+    examples = getattr(dataset, "examples", None) or []
+    patched = 0
+    for ex in examples:
+        if isinstance(ex, dict) and "node_id" not in ex and "id" in ex:
+            ex["node_id"] = ex["id"]
+            patched += 1
+    if patched:
+        log.debug("shimmed node_id onto %d dataset example(s)", patched)
 
 
 # --- task + evaluator construction ------------------------------------------
