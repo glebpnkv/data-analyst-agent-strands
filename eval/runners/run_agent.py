@@ -126,22 +126,26 @@ class DeployedAgentClient:
         result: AgentRunResult,
         in_flight: dict[str, ToolCall],
     ) -> None:
+        # Event-name keys match the v1 wire protocol exactly — see
+        # agent_server/events.py. Dotted names, not underscored. The
+        # tool ID field is "id" on both tool.start and tool.end.
         kind = event.get("event")
         data = event.get("data") or {}
-        if kind == "text_delta":
+        if kind == "text.delta":
             result.answer += data.get("content", "")
-        elif kind == "tool_start":
-            tool_use_id = data.get("tool_use_id") or uuid.uuid4().hex
+        elif kind == "tool.start":
+            tool_use_id = data.get("id") or uuid.uuid4().hex
             in_flight[tool_use_id] = ToolCall(
                 name=data.get("name", ""),
-                input=data.get("input_partial") or data.get("input") or {},
+                input=data.get("input") or {},
             )
-        elif kind == "tool_end":
-            tool_use_id = data.get("tool_use_id", "")
+        elif kind == "tool.end":
+            tool_use_id = data.get("id", "")
             call = in_flight.pop(tool_use_id, None)
             if call is None:
-                # tool_end without tool_start (shouldn't happen) — keep
-                # it anyway so it shows up in tool_call_count.
+                # tool.end without a matching tool.start (shouldn't
+                # happen) — record it anyway so it counts in
+                # tool_call_count and the discrepancy is visible.
                 call = ToolCall(name="<unknown>", input={})
             call.status = data.get("status")
             call.summary = data.get("summary")
