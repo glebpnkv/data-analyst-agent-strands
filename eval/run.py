@@ -91,7 +91,8 @@ def main() -> int:
     )
 
     task = _build_task(agent_client)
-    evaluators = _build_evaluators()
+    disable_judge = args.no_llm_judge or _env_truthy("EVAL_NO_LLM_JUDGE")
+    evaluators = _build_evaluators(disable_judge=disable_judge)
 
     experiment_name = args.experiment_name or _default_experiment_name()
     experiment_metadata = {
@@ -137,6 +138,16 @@ def _parse_args() -> argparse.Namespace:
         "--experiment-name",
         default=None,
         help="Experiment name shown in Phoenix. Defaults to a git-sha-based name.",
+    )
+    parser.add_argument(
+        "--no-llm-judge",
+        action="store_true",
+        help=(
+            "Skip the Bedrock-backed LLM judge. Only the deterministic "
+            "text_contains check runs. Use this when running offline, "
+            "when you want zero Bedrock spend, or when AWS creds aren't "
+            "available. Equivalent: EVAL_NO_LLM_JUDGE=1."
+        ),
     )
     return parser.parse_args()
 
@@ -217,7 +228,11 @@ def _build_task(agent_client: DeployedAgentClient):
     return task
 
 
-def _build_evaluators() -> list:
+def _env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_evaluators(*, disable_judge: bool = False) -> list:
     """Phoenix-callable evaluators.
 
     Two-tier setup, each producing one annotation per task run:
@@ -250,6 +265,9 @@ def _build_evaluators() -> list:
         return (verdict.score, label, explanation)
 
     evaluators: list = [text_contains]
+    if disable_judge:
+        log.info("LLM judge disabled (--no-llm-judge / EVAL_NO_LLM_JUDGE).")
+        return evaluators
     judge = _build_correctness_judge()
     if judge is not None:
         evaluators.append(judge)
