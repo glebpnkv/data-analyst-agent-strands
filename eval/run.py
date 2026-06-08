@@ -112,7 +112,8 @@ def main() -> int:
     )
 
     experiment_url = phoenix_client.experiments.get_experiment_url(
-        dataset_id=dataset.id, experiment_id=ran.id,
+        dataset_id=ran["dataset_id"],
+        experiment_id=ran["experiment_id"],
     )
     log.info("Experiment URL: %s", experiment_url)
 
@@ -269,22 +270,29 @@ def _git_branch() -> str:
 
 
 def _all_passed(ran) -> bool:
-    """True if every (run × evaluator) returned score == 1.0.
+    """True if every task succeeded AND every evaluator scored 1.0.
 
-    `ran.runs` is a list of ExperimentRun, each with `.evaluation_runs`
-    (Phoenix's RanExperiment shape across recent client versions).
+    Phoenix's RanExperiment is a TypedDict (dict subclass) with
+    `task_runs` (list of ExperimentRun TypedDicts) and `evaluation_runs`
+    (list of ExperimentEvaluationRun TypedDicts, one per (run, evaluator)
+    pair). A task with `error` set never produces evaluations, so we
+    have to check both lists.
     """
-    runs = getattr(ran, "runs", None) or []
-    if not runs:
+    task_runs = ran.get("task_runs") or []
+    if not task_runs:
         return False
-    for r in runs:
-        evals = getattr(r, "evaluation_runs", None) or getattr(r, "evaluations", None) or []
-        if not evals:
+    if any(r.get("error") for r in task_runs):
+        return False
+    eval_runs = ran.get("evaluation_runs") or []
+    if not eval_runs:
+        return False
+    for er in eval_runs:
+        if er.get("error"):
             return False
-        for e in evals:
-            score = getattr(getattr(e, "result", e), "score", None)
-            if score is None or float(score) < 1.0:
-                return False
+        result = er.get("result") or {}
+        score = result.get("score") if isinstance(result, dict) else None
+        if score is None or float(score) < 1.0:
+            return False
     return True
 
 
@@ -301,7 +309,7 @@ def _write_local_report(
         "version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "experiment_name": experiment_name,
-        "experiment_id": getattr(ran, "id", None),
+        "experiment_id": ran.get("experiment_id"),
         "experiment_url": experiment_url,
         "metadata": metadata,
         "summary": _summarise_for_report(ran),
@@ -311,19 +319,42 @@ def _write_local_report(
 
 
 def _summarise_for_report(ran) -> dict[str, Any]:
-    runs = getattr(ran, "runs", None) or []
-    total = len(runs)
+    """Per-task pass/fail counts from the flat evaluation_runs list.
+
+    `evaluation_runs` is keyed off `experiment_run_id`; we group by it
+    and a task passes only if every evaluator on it scored 1.0 with no
+    error, and the task itself didn't error out.
+    """
+    task_runs = ran.get("task_runs") or []
+    eval_runs = ran.get("evaluation_runs") or []
+    total = len(task_runs)
+    errored_run_ids = {r["id"] for r in task_runs if r.get("error")}
+
+    evals_by_run: dict[str, list[dict[str, Any]]] = {}
+    for er in eval_runs:
+        evals_by_run.setdefault(er.get("experiment_run_id", ""), []).append(er)
+
     passed = 0
-    for r in runs:
-        evals = getattr(r, "evaluation_runs", None) or getattr(r, "evaluations", None) or []
-        if evals and all(
-            (float(getattr(getattr(e, "result", e), "score", 0)) >= 1.0) for e in evals
-        ):
+    for r in task_runs:
+        if r["id"] in errored_run_ids:
+            continue
+        ers = evals_by_run.get(r["id"]) or []
+        if not ers:
+            continue
+        if any(er.get("error") for er in ers):
+            continue
+        scores = [
+            (er.get("result") or {}).get("score") if isinstance(er.get("result"), dict) else None
+            for er in ers
+        ]
+        if all(s is not None and float(s) >= 1.0 for s in scores):
             passed += 1
+
     return {
         "total": total,
         "passed": passed,
         "failed": total - passed,
+        "errored_tasks": len(errored_run_ids),
         "all_passed": total > 0 and passed == total,
     }
 
