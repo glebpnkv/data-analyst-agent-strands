@@ -390,9 +390,21 @@ def make_agent(
     :return: Agent, optional CI session name, optional code interpreter tool
     """
     session = boto3.Session(profile_name=profile, region_name=region)
+    # cache_prompt + cache_tools enable Bedrock prompt caching on the
+    # system prompt (large: base prompt + Glue rules + GitHub rules +
+    # CI handoff rules + Skills tool defs, ~10-15k tokens) and the tool
+    # definitions. Bedrock charges cached input tokens at ~10% of the
+    # base rate ($0.30/1M vs $3/1M on Sonnet 4.5) and cache writes at
+    # ~1.25x the base rate, with a 5-minute default TTL. For multi-turn
+    # eval runs that hit the same system prompt repeatedly within a
+    # session, this cuts input-token cost by ~80-90%. Output tokens are
+    # unchanged. "default" sets the cache breakpoint at the natural
+    # boundary (end of system prompt / end of tool defs).
     model = BedrockModel(
         boto_session=session,
         model_id=model_id,
+        cache_prompt="default",
+        cache_tools="default",
     )
 
     aws_api_mcp_client = make_aws_api_mcp_client()
