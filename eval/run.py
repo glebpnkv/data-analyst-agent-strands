@@ -145,6 +145,18 @@ def _run_one(client: DeployedAgentClient, golden: dict[str, Any]) -> dict[str, A
         log.exception("Agent call failed for %s", golden["id"])
         run = AgentRunResult(session_id="", answer="")
         run_error = f"{type(e).__name__}: {e}"
+    finally:
+        # Each golden gets a fresh session; close it so the agent
+        # releases the sandbox + MCP subprocesses now instead of
+        # parking the session for the idle TTL. Without this, every
+        # eval run leaves N stranded sandbox tasks pinning cluster
+        # capacity and the pool can't refill for subsequent runs.
+        try:
+            sid = run.session_id  # type: ignore[possibly-unbound]
+        except NameError:
+            sid = ""
+        if sid:
+            client.close_session(sid)
 
     checks = _apply_checks(golden, run)
     passed = all(c["passed"] for c in checks)

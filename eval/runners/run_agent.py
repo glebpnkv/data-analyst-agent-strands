@@ -92,6 +92,26 @@ class DeployedAgentClient:
             )
         return cls(base_url=base, service_auth_secret=secret)
 
+    def close_session(self, session_id: str) -> None:
+        """End the named session so the agent releases its sandbox + MCP subprocesses.
+
+        Idempotent on the agent side — a 204 is returned whether or not
+        the session was still alive. We do this after every eval golden
+        so the cluster's sandbox capacity is freed for the next case
+        rather than parked until the session TTL fires.
+        """
+        if not session_id:
+            return
+        url = f"{self.base_url}/v1/sessions/{session_id}"
+        headers = {"X-Service-Auth": self.service_auth_secret}
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                client.delete(url, headers=headers)
+        except Exception as e:  # noqa: BLE001
+            # Cleanup failure shouldn't fail the eval run; the session's
+            # idle TTL will reap it eventually.
+            log.warning("close_session(%s) failed: %s", session_id, e)
+
     def chat(self, prompt: str, *, session_id: str | None = None) -> AgentRunResult:
         """Send one prompt, drain the SSE stream, return the normalised result."""
         sid = session_id or uuid.uuid4().hex
