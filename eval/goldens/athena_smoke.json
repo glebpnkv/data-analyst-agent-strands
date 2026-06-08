@@ -1,0 +1,32 @@
+[
+  {
+    "id": "athena-smoke-iris-row-count",
+    "tags": ["athena", "smoke", "read-only", "iris"],
+    "input": "How many rows are in the iris table in sample_database?",
+    "expected_answer_contains": ["150"],
+    "context": [
+      "sample_database.iris contains 150 rows (50 per species).",
+      "Smoke test: confirms agent can find a table, write COUNT(*), get the right number, surface it in the answer."
+    ]
+  },
+  {
+    "id": "athena-smoke-iris-species-list",
+    "tags": ["athena", "smoke", "read-only", "iris"],
+    "input": "What species are present in the iris table in sample_database?",
+    "expected_answer_contains": ["setosa", "versicolor", "virginica"],
+    "context": [
+      "sample_database.iris has a `species` column with three values: setosa, versicolor, virginica.",
+      "Smoke test: distinct on a categorical column; tests that the agent surfaces all three names rather than truncating."
+    ]
+  },
+  {
+    "id": "athena-smoke-iris-smallest-petals",
+    "tags": ["athena", "smoke", "iris", "aggregation"],
+    "input": "In the iris table in sample_database, which species has the smallest average petal length?",
+    "expected_answer_contains": ["setosa"],
+    "context": [
+      "Setosa has the smallest average petal length by a wide margin (~1.46cm vs ~4.26 for versicolor and ~5.55 for virginica).",
+      "Smoke test: group-by + aggregation + min selection. One correct answer."
+    ]
+  }
+]
