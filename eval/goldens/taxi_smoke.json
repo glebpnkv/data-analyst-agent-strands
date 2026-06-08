@@ -3,10 +3,11 @@
     "id": "taxi-vendor-distinct-count",
     "tags": ["athena", "taxi", "aggregation", "smoke"],
     "input": "How many distinct vendor_id values appear in eval_taxi.taxi_trips?",
-    "expected_answer_contains": ["2"],
+    "expected_answer_contains": ["3"],
     "context": [
-      "TLC schema documents exactly two vendors: vendor_id 1 (Creative Mobile Technologies) and vendor_id 2 (VeriFone Inc.).",
-      "Stable across months — substring check on '2' is robust unless the agent fabricates a different number."
+      "The currently-loaded eval_taxi.taxi_trips slice contains 3 distinct vendor_id values, verified via `SELECT DISTINCT vendor_id FROM eval_taxi.taxi_trips` against the loaded data.",
+      "Older TLC docs list only 2 vendors (1 = Creative Mobile Technologies, 2 = VeriFone Inc.) — newer months added a third operator. If the loader is pointed at a much-older month, re-verify before assuming 3.",
+      "Lesson: LLM judges read the reviewer notes as ground truth, so a stale claim here will cause the judge to mark a correct agent answer as incorrect."
     ]
   },
   {
