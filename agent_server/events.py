@@ -36,10 +36,19 @@ def tool_end(
     return _sse("tool.end", payload)
 
 
-def done(usage: dict[str, Any] | None = None) -> dict[str, str]:
+def done(
+    usage: dict[str, Any] | None = None,
+    *,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+) -> dict[str, str]:
     payload: dict[str, Any] = {"protocol": PROTOCOL_VERSION}
     if usage is not None:
         payload["usage"] = usage
+    if trace_id:
+        payload["trace_id"] = trace_id
+    if span_id:
+        payload["span_id"] = span_id
     return _sse("done", payload)
 
 

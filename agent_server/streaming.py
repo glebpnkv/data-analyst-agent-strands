@@ -38,10 +38,15 @@ class StrandsEventReducer:
         if not isinstance(sdk_event, dict):
             return
 
-        # Final agent result — emit `done`.
+        # Final agent result — emit `done`. Capture the OTel trace/span
+        # IDs now: Strands is still inside its agent-root span at this
+        # point, so `get_current_span()` returns the span Phoenix will
+        # surface as the trace root. Callers (eval runners, Chainlit)
+        # use these to look the trace up in Phoenix or post annotations.
         if "result" in sdk_event and "data" not in sdk_event:
             usage = self._extract_usage(sdk_event.get("result"))
-            yield ev.done(usage=usage)
+            trace_id, span_id = self._current_trace_and_span_ids()
+            yield ev.done(usage=usage, trace_id=trace_id, span_id=span_id)
             return
 
         # Reasoning text streaming.
@@ -82,6 +87,25 @@ class StrandsEventReducer:
             return
 
         # All other event types are ignored in v0.
+
+    @staticmethod
+    def _current_trace_and_span_ids() -> tuple[str | None, str | None]:
+        """Return the current OTel trace/span IDs as 32- and 16-hex strings.
+
+        Returns (None, None) if OTel is not installed or no span is
+        active. Hex-encoded matches what Phoenix shows in its UI.
+        """
+        try:
+            from opentelemetry import trace
+        except Exception:
+            return None, None
+        span = trace.get_current_span()
+        if span is None:
+            return None, None
+        ctx = span.get_span_context()
+        if not ctx or not ctx.is_valid:
+            return None, None
+        return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
 
     @staticmethod
     def _extract_usage(result: Any) -> dict[str, Any] | None:

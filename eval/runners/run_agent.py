@@ -51,6 +51,8 @@ class AgentRunResult:
     answer: str  # accumulated text_delta content
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: dict | None = None  # token counts from `done` event
+    trace_id: str | None = None  # OTel trace id (32 hex) from `done`
+    span_id: str | None = None  # OTel root span id (16 hex) from `done`
     errors: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     raw_events: list[dict] = field(default_factory=list)  # for debugging
@@ -172,6 +174,8 @@ class DeployedAgentClient:
             result.tool_calls.append(call)
         elif kind == "done":
             result.usage = data.get("usage")
+            result.trace_id = data.get("trace_id")
+            result.span_id = data.get("span_id")
         elif kind == "error":
             result.errors.append(data.get("message", "<no message>"))
 
