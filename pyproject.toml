@@ -54,6 +54,11 @@ dev = [
     # arize-phoenix-otel from runtime deps.
     "arize-phoenix>=10.0.0",
     "arize-phoenix-client>=2.0.0",
+    # Routes Phoenix's LLM-judge evaluators (CorrectnessEvaluator,
+    # custom create_classifier judges, etc.) through Bedrock. boto3 is
+    # already present; litellm fills in the Bedrock client adapter
+    # Phoenix's LLM wrapper expects.
+    "litellm>=1.55.0",
 ]
 
 [tool.pytest.ini_options]

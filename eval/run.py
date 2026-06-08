@@ -218,7 +218,23 @@ def _build_task(agent_client: DeployedAgentClient):
 
 
 def _build_evaluators() -> list:
-    """Phoenix-callable evaluators. Each returns (score, label, explanation)."""
+    """Phoenix-callable evaluators.
+
+    Two-tier setup, each producing one annotation per task run:
+
+    1. `text_contains` — deterministic cheap gate. Hand-rolled (Phoenix's
+       MatchesRegex would do the same job, but we already have our own
+       and it costs zero per run).
+    2. `correctness_judge` — LLM-as-judge via Phoenix's
+       create_classifier. Bedrock Haiku 4.5 reads the question, agent
+       answer, expected substrings, and reviewer notes from the golden,
+       and classifies correct/incorrect. This is the one that catches
+       refusal/gotcha goldens where text_contains is too permissive.
+
+    The judge is skipped (with a warning) if AWS creds aren't available
+    or Bedrock returns an error, so the deterministic gate still runs
+    in offline / CI-without-Bedrock contexts.
+    """
 
     def text_contains(output: dict[str, Any], expected: dict[str, Any], **_: Any):
         if output.get("run_error"):
@@ -233,7 +249,63 @@ def _build_evaluators() -> list:
         )
         return (verdict.score, label, explanation)
 
-    return [text_contains]
+    evaluators: list = [text_contains]
+    judge = _build_correctness_judge()
+    if judge is not None:
+        evaluators.append(judge)
+    return evaluators
+
+
+def _build_correctness_judge():
+    """Construct a Phoenix ClassificationEvaluator backed by Bedrock Haiku.
+
+    Returns None if Phoenix/litellm/Bedrock plumbing can't be set up,
+    so the deterministic check still runs without LLM-judge coverage.
+    Override the model via EVAL_JUDGE_MODEL.
+    """
+    model_id = os.environ.get(
+        "EVAL_JUDGE_MODEL", "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+    )
+    try:
+        from phoenix.evals import LLM, create_classifier
+    except Exception as e:  # noqa: BLE001
+        log.warning("LLM judge disabled: phoenix.evals import failed (%s)", e)
+        return None
+
+    try:
+        llm = LLM(provider="bedrock", model=model_id, client="litellm")
+    except Exception as e:  # noqa: BLE001
+        log.warning("LLM judge disabled: could not build Bedrock LLM (%s)", e)
+        return None
+
+    template = (
+        "You are evaluating a data-analyst agent's answer against an eval golden.\n"
+        "\n"
+        "<question>\n{{input}}\n</question>\n"
+        "\n"
+        "<agent_answer>\n{{output}}\n</agent_answer>\n"
+        "\n"
+        "<expected>\n"
+        "The answer should contain these substrings (case-insensitive): {{expected}}\n"
+        "</expected>\n"
+        "\n"
+        "<reviewer_notes>\n{{metadata}}\n</reviewer_notes>\n"
+        "\n"
+        "Judging guidance:\n"
+        "- For factual questions: 'correct' means the agent's answer is factually right and addresses the question; the expected substrings + reviewer notes describe the ground truth.\n"
+        "- For refusal cases: 'correct' means the agent honestly declined / explained the data limitation rather than fabricating a number.\n"
+        "- For wrong-premise cases (e.g. data outside the dataset's range): 'correct' means the agent acknowledged that no data exists rather than computing over the wrong slice.\n"
+        "- If the agent errored before producing an answer, output is 'incorrect'.\n"
+        "\n"
+        "Is the agent's answer correct or incorrect?\n"
+    )
+    log.info("LLM judge enabled: Bedrock model=%s", model_id)
+    return create_classifier(
+        name="correctness",
+        llm=llm,
+        prompt_template=template,
+        choices={"correct": 1.0, "incorrect": 0.0},
+    )
 
 
 # --- report + helpers -------------------------------------------------------
