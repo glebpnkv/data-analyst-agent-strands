@@ -159,17 +159,16 @@ def _setup_strands_telemetry(run_dir: Path) -> IO[str] | None:
         # patches boto3 bedrock-runtime calls and emits OpenInference-
         # conformant child spans nested inside Strands' parents.
         #
-        # The Strands instrumentor on top rewrites the *parent* spans
-        # (the AGENT / TOOL / per-cycle spans Strands emits) into
-        # OpenInference span-kind form (openinference.span.kind=AGENT/TOOL/LLM).
-        # Without it Phoenix shows the trace as a wall of generic spans;
-        # with it Phoenix renders the agent trajectory tree natively and
-        # Tool Selection / Trajectory evaluators can read the right
-        # attributes. Order matters: instrument Bedrock first, then
-        # Strands — the Strands wrapper assumes Bedrock spans already
-        # carry their OpenInference attributes.
+        # The Strands-Agents → OpenInference processor sits on the
+        # tracer provider and rewrites the *parent* spans (the AGENT /
+        # CHAIN / TOOL / per-cycle spans Strands emits) on the way out,
+        # mapping invoke_agent → AGENT, execute_event_loop_cycle → CHAIN
+        # etc., plus gen_ai.* → llm.*. Without it Phoenix shows the
+        # trace as a wall of generic spans; with it Phoenix renders the
+        # agent trajectory tree natively and Tool Selection / Trajectory
+        # evaluators can read the right attributes.
         _instrument_bedrock_for_openinference()
-        _instrument_strands_for_openinference()
+        _attach_strands_to_openinference_processor(telemetry)
 
     telemetry.setup_meter(
         enable_console_exporter=False,
@@ -198,30 +197,39 @@ def _instrument_bedrock_for_openinference() -> None:
         log.warning("OpenInference Bedrock instrumentation failed: %s", e)
 
 
-def _instrument_strands_for_openinference() -> None:
-    """Rewrite Strands' own AGENT / TOOL spans into OpenInference span-kind form.
+def _attach_strands_to_openinference_processor(telemetry) -> None:
+    """Attach the Strands→OpenInference span processor to the tracer provider.
 
-    Without this, Phoenix can ingest the spans but treats them as
-    generic — the trajectory tree, tool-selection evaluators, and
-    AgentCore-shaped metrics all key off `openinference.span.kind` which
-    Strands doesn't emit natively.
+    The package ships a span processor (not an Instrumentor) that
+    transforms Strands' OTel-GenAI-shaped spans into OpenInference
+    shape on the way to the exporter. Without it, Phoenix ingests the
+    spans but renders them with unknown `openinference.span.kind`, and
+    trajectory / tool-selection evaluators have nothing to read.
     """
     try:
-        from openinference.instrumentation.strands import StrandsAgentsInstrumentor
+        from openinference.instrumentation.strands_agents import (
+            StrandsAgentsToOpenInferenceProcessor,
+        )
     except Exception as e:
-        log.debug("openinference-instrumentation-strands-agents not installed: %s", e)
+        log.warning("openinference-instrumentation-strands-agents import failed: %s", e)
         return
 
-    instrumentor = StrandsAgentsInstrumentor()
-    if instrumentor.is_instrumented_by_opentelemetry:
-        log.debug("Strands Agents instrumentor already installed")
+    provider = getattr(telemetry, "tracer_provider", None)
+    if provider is None or not hasattr(provider, "add_span_processor"):
+        log.warning(
+            "StrandsTelemetry.tracer_provider missing add_span_processor; "
+            "skipping OpenInference processor"
+        )
         return
 
     try:
-        instrumentor.instrument()
-        log.info("OpenInference Strands Agents instrumentation enabled (AGENT/TOOL span kinds)")
+        provider.add_span_processor(StrandsAgentsToOpenInferenceProcessor(debug=False))
+        log.info(
+            "OpenInference Strands Agents span processor attached "
+            "(spans will carry openinference.span.kind)"
+        )
     except Exception as e:
-        log.warning("OpenInference Strands Agents instrumentation failed: %s", e)
+        log.warning("Strands→OpenInference processor attach failed: %s", e)
 
 
 def _otlp_enabled() -> bool:
