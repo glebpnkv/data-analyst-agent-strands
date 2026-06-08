@@ -765,6 +765,16 @@ class ComputeStack(cdk.Stack):
                 # 5s default flush is too laggy for snappy "View trace"
                 # demos; 1s keeps traces appearing while still batching.
                 "OTEL_BSP_SCHEDULE_DELAY": "1000",
+                # Route traces into a named Phoenix project. Phoenix
+                # reads `openinference.project.name` from the OTel
+                # resource attributes (NOT from PHOENIX_PROJECT_NAME —
+                # that var only works via phoenix.otel.register, which
+                # we don't use; Strands uses plain OTel SDK setup).
+                # Stage-suffixed so a future prod/staging deploy lands
+                # in a separate Phoenix project automatically.
+                "OTEL_RESOURCE_ATTRIBUTES": (
+                    f"openinference.project.name=data-analyst-agent-{stage.lower()}"
+                ),
                 # Identifies the build in every span attribute.
                 # `agent_version` context is set by deploy_agent.sh from
                 # `git rev-parse --short HEAD`; fallback to "deployed"
