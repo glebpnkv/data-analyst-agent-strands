@@ -52,6 +52,7 @@ from aws_cdk import aws_rds as rds
 from aws_cdk import aws_route53 as route53
 from aws_cdk import aws_route53_targets as route53_targets
 from aws_cdk import aws_secretsmanager as secretsmanager
+from aws_cdk import aws_servicediscovery as servicediscovery
 from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
@@ -73,6 +74,15 @@ FRONTEND_TASK_CPU = 256  # 0.25 vCPU
 FRONTEND_TASK_MEMORY_MIB = 512  # 0.5 GB
 PHOENIX_TASK_CPU = 512  # 0.5 vCPU
 PHOENIX_TASK_MEMORY_MIB = 2048  # 2 GB
+GATEWAY_TASK_CPU = 128  # 1/8 vCPU — HAProxy is feather-light
+GATEWAY_TASK_MEMORY_MIB = 256  # 256 MB — connection counts here are tiny
+
+# Cloud Map private DNS namespace under which the agent service
+# registers each task as an A record. The gateway resolves
+# `<service>.<namespace>` and consistent-hashes incoming requests
+# across the resulting IPs. Namespace lives only inside the VPC.
+CLOUDMAP_NAMESPACE = "dataanalyst.local"
+AGENT_CLOUDMAP_SERVICE = "agent"  # → agent.dataanalyst.local
 
 # Phoenix container tag. Pinned for reproducibility; bump deliberately
 # after reading the release notes — Phoenix's storage schema migrates
@@ -115,9 +125,12 @@ class ComputeStack(cdk.Stack):
         sandbox_task_sg: ec2.ISecurityGroup,
         phoenix_alb_sg: ec2.ISecurityGroup,
         phoenix_task_sg: ec2.ISecurityGroup,
+        gateway_alb_sg: ec2.ISecurityGroup,
+        gateway_task_sg: ec2.ISecurityGroup,
         agent_repo: ecr.IRepository,
         frontend_repo: ecr.IRepository,
         sandbox_repo: ecr.IRepository,
+        gateway_repo: ecr.IRepository,
         db_instance: rds.IDatabaseInstance,
         db_secret: secretsmanager.ISecret,
         hosted_zone: route53.IHostedZone,
@@ -162,6 +175,23 @@ class ComputeStack(cdk.Stack):
             "Cluster",
             vpc=vpc,
             container_insights_v2=ecs.ContainerInsights.DISABLED,
+        )
+
+        # Private Cloud Map DNS namespace. The agent service registers
+        # each running task as an A record under this namespace (e.g.
+        # `agent.dataanalyst.local`); the HAProxy gateway resolves the
+        # name and consistent-hashes incoming /v1/chat requests across
+        # the resulting set of task IPs. Namespace is VPC-scoped — DNS
+        # only resolves from inside the VPC.
+        self.cloudmap_namespace = servicediscovery.PrivateDnsNamespace(
+            self,
+            "CloudMapNamespace",
+            name=CLOUDMAP_NAMESPACE,
+            vpc=vpc,
+            description=(
+                "Internal service discovery for agent ↔ gateway hops. "
+                "Not used for prod traffic into the cluster from outside."
+            ),
         )
 
         # ENI trunking is an account/region-wide ECS setting that is NOT
@@ -808,6 +838,12 @@ class ComputeStack(cdk.Stack):
 
         # Ec2Service uses the cluster's default capacity provider
         # strategy (set above), so no explicit strategy here.
+        # cloud_map_options registers each agent task IP under
+        # `agent.dataanalyst.local`; the gateway resolves that name and
+        # consistent-hashes /v1/chat across the resulting set. Tasks
+        # auto-deregister when they stop. ALB target registration stays
+        # so ECS can still deploy-gate on ALB health and so the SSM
+        # port-forward path (eval runner) keeps working.
         self.agent_service = ecs.Ec2Service(
             self,
             "AgentService",
@@ -819,6 +855,12 @@ class ComputeStack(cdk.Stack):
             min_healthy_percent=0,  # allow 0 -> 1 transition without rolling-deploy back-pressure
             max_healthy_percent=200,
             enable_execute_command=True,
+            cloud_map_options=ecs.CloudMapOptions(
+                name=AGENT_CLOUDMAP_SERVICE,
+                cloud_map_namespace=self.cloudmap_namespace,
+                dns_record_type=servicediscovery.DnsRecordType.A,
+                dns_ttl=cdk.Duration.seconds(10),
+            ),
         )
 
         agent_listener.add_targets(
@@ -827,6 +869,119 @@ class ComputeStack(cdk.Stack):
             protocol=elbv2.ApplicationProtocol.HTTP,
             targets=[self.agent_service],
             health_check=elbv2.HealthCheck(
+                path="/healthz",
+                healthy_http_codes="200",
+                interval=cdk.Duration.seconds(15),
+                timeout=cdk.Duration.seconds(5),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=3,
+            ),
+            deregistration_delay=cdk.Duration.seconds(15),
+        )
+
+        # =====================================================================
+        # GATEWAY (HAProxy): session-affinity in front of the agent service
+        # =====================================================================
+        # Why this exists: with N>1 agent tasks, the agent ALB's
+        # round-robin LB would scatter a single session's turns across
+        # tasks, and each task only knows about the sessions it has
+        # served. The gateway reads X-Session-Id and consistent-hashes
+        # against the live agent task set (via Cloud Map DNS), so a
+        # session sticks to one task until that task disappears.
+        # See `gateway/haproxy.cfg` for the routing config.
+        gateway_task_role = iam.Role(
+            self,
+            "GatewayTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            description="Runtime role for the HAProxy gateway ECS task (no AWS calls needed)",
+        )
+
+        gateway_log_group = logs.LogGroup(
+            self,
+            "GatewayLogGroup",
+            log_group_name=f"/ecs/data-analyst-agent/{stage.lower()}/gateway",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+        gateway_task_def = ecs.Ec2TaskDefinition(
+            self,
+            "GatewayTaskDef",
+            task_role=gateway_task_role,
+            network_mode=ecs.NetworkMode.AWS_VPC,
+        )
+
+        gateway_task_def.add_container(
+            "gateway",
+            container_name="gateway",
+            image=ecs.ContainerImage.from_ecr_repository(gateway_repo, tag="latest"),
+            cpu=GATEWAY_TASK_CPU,
+            memory_limit_mib=GATEWAY_TASK_MEMORY_MIB,
+            essential=True,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="gateway",
+                log_group=gateway_log_group,
+            ),
+            port_mappings=[
+                # 80 = main listener; 8404 = stats + /healthz used by
+                # the gateway ALB's target health check.
+                ecs.PortMapping(container_port=ALB_HTTP_PORT, protocol=ecs.Protocol.TCP),
+                ecs.PortMapping(container_port=8404, protocol=ecs.Protocol.TCP),
+            ],
+            environment={
+                # haproxy.cfg substitutes these into the server-template
+                # backend at startup. Cloud Map FQDN resolves to all
+                # currently-running agent tasks under the namespace.
+                "AGENT_SERVICE_DNS": (
+                    f"{AGENT_CLOUDMAP_SERVICE}.{CLOUDMAP_NAMESPACE}"
+                ),
+                "AGENT_SERVICE_PORT": str(AGENT_HTTP_PORT),
+            },
+        )
+
+        self.gateway_alb = elbv2.ApplicationLoadBalancer(
+            self,
+            "GatewayAlb",
+            vpc=vpc,
+            internet_facing=False,
+            security_group=gateway_alb_sg,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            idle_timeout=cdk.Duration.seconds(120),
+        )
+
+        gateway_listener = self.gateway_alb.add_listener(
+            "GatewayListener",
+            port=ALB_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            open=False,  # SG-controlled
+        )
+
+        self.gateway_service = ecs.Ec2Service(
+            self,
+            "GatewayService",
+            cluster=self.cluster,
+            task_definition=gateway_task_def,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            security_groups=[gateway_task_sg],
+            health_check_grace_period=cdk.Duration.seconds(30),
+            min_healthy_percent=0,
+            max_healthy_percent=200,
+            enable_execute_command=True,
+        )
+
+        # Health check hits the stats listener on :8404 (which serves
+        # /healthz). HAProxy's main listener (:80) is what carries
+        # production traffic.
+        gateway_listener.add_targets(
+            "GatewayTargets",
+            port=ALB_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            targets=[self.gateway_service.load_balancer_target(
+                container_name="gateway",
+                container_port=ALB_HTTP_PORT,
+            )],
+            health_check=elbv2.HealthCheck(
+                port="8404",
                 path="/healthz",
                 healthy_http_codes="200",
                 interval=cdk.Duration.seconds(15),
@@ -882,10 +1037,14 @@ class ComputeStack(cdk.Stack):
             ],
             environment={
                 "AWS_REGION": self.region,
-                # Same-stack reference: agent ALB's DNS resolves to the
-                # internal IP. http://<dns> with no port = port 80, where
-                # the agent's listener forwards to container port 8080.
-                "AGENT_BASE_URL": f"http://{self.agent_alb.load_balancer_dns_name}",
+                # Same-stack reference: gateway ALB's DNS resolves to
+                # the internal IP. http://<dns> with no port = port 80,
+                # where the gateway listens, then HAProxy hashes by
+                # X-Session-Id and forwards to the right agent task.
+                # Direct agent ALB still exists (used by SSM port-forward
+                # for ad-hoc debug); production traffic flows through
+                # the gateway.
+                "AGENT_BASE_URL": f"http://{self.gateway_alb.load_balancer_dns_name}",
                 "AGENT_REQUEST_TIMEOUT_SECONDS": "600",
                 "DB_SECRET_ARN": db_secret.secret_arn,
                 "DEPLOYED_BEHIND_ALB": "1",
@@ -1101,6 +1260,19 @@ class ComputeStack(cdk.Stack):
             "PhoenixOtlpEndpointParam",
             parameter_name=f"{ssm_prefix}/phoenix/otlp-endpoint",
             string_value=f"http://{self.phoenix_alb.load_balancer_dns_name}",
+        )
+
+        ssm.StringParameter(
+            self,
+            "GatewayServiceNameParam",
+            parameter_name=f"{ssm_prefix}/gateway/service-name",
+            string_value=self.gateway_service.service_name,
+        )
+        ssm.StringParameter(
+            self,
+            "GatewayAlbDnsParam",
+            parameter_name=f"{ssm_prefix}/gateway/alb-dns",
+            string_value=self.gateway_alb.load_balancer_dns_name,
         )
 
         # Top-level convenience output: public HTTPS URL behind Cognito.

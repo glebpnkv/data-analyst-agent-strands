@@ -149,6 +149,26 @@ class NetworkStack(cdk.Stack):
             allow_all_outbound=True,
         )
 
+        # Session-affinity gateway (HAProxy). Sits between frontend
+        # tasks and agent tasks; routes /v1/chat by consistent hash on
+        # the X-Session-Id header so the same session always lands on
+        # the same agent task while it's healthy.
+        self.gateway_alb_sg = ec2.SecurityGroup(
+            self,
+            "GatewayAlbSg",
+            vpc=self.vpc,
+            description="Gateway (HAProxy) ALB. Accepts traffic from frontend tasks + VPC for SSM port-forward.",
+            allow_all_outbound=True,
+        )
+
+        self.gateway_task_sg = ec2.SecurityGroup(
+            self,
+            "GatewayTaskSg",
+            vpc=self.vpc,
+            description="Gateway (HAProxy) ECS tasks. Reachable from gateway ALB; talks to agent tasks directly via Cloud Map.",
+            allow_all_outbound=True,
+        )
+
         # ---- Pairwise ingress rules ----------------------------------------
         # Trust path (ALBs listen on 80, container ports differ):
         #   user --[ALB_HTTP_PORT=80]--> frontend_alb_sg
@@ -254,6 +274,40 @@ class NetworkStack(cdk.Stack):
             peer=self.phoenix_task_sg,
             connection=ec2.Port.tcp(POSTGRES_PORT),
             description="Phoenix task to Postgres (Phoenix-owned logical DB)",
+        )
+
+        # Gateway wiring. The trust path replaces direct frontend→agent
+        # ALB calls (which round-robined) with consistent-hash routing
+        # through the gateway:
+        #   frontend_task --[ALB_HTTP_PORT=80]--> gateway_alb_sg
+        #   gateway_alb_sg --[ALB_HTTP_PORT=80]--> gateway_task_sg
+        #   gateway_task_sg --[AGENT_HTTP_PORT=8080]--> agent_task_sg
+        #     (gateway resolves agent task IPs via Cloud Map DNS,
+        #      bypassing the agent ALB which only does round-robin)
+        #   any VPC source --[ALB_HTTP_PORT=80]--> gateway_alb_sg
+        #     (SSM port-forward for eval runner, mirrors agent/phoenix)
+        # NB: the frontend_task → agent_alb rule above stays in place
+        # so direct-to-agent debug paths still work; production traffic
+        # now flows through the gateway.
+        self.gateway_alb_sg.add_ingress_rule(
+            peer=self.frontend_task_sg,
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Frontend tasks to gateway ALB (production /v1/chat path)",
+        )
+        self.gateway_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Dev: VPC-internal sources reach gateway ALB (SSM port-forward via ECS EC2 hosts)",
+        )
+        self.gateway_task_sg.add_ingress_rule(
+            peer=self.gateway_alb_sg,
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Gateway ALB to gateway (HAProxy) tasks",
+        )
+        self.agent_task_sg.add_ingress_rule(
+            peer=self.gateway_task_sg,
+            connection=ec2.Port.tcp(AGENT_HTTP_PORT),
+            description="Gateway tasks to agent tasks (Cloud-Map-resolved, bypassing agent ALB)",
         )
 
         # ---- Outputs (visible in CloudFormation console) -------------------

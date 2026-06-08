@@ -39,7 +39,7 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 <agent|frontend|all>
+Usage: $0 <agent|frontend|gateway|all>
 EOF
   exit 2
 }
@@ -49,7 +49,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 case "$1" in
-  agent|frontend|all) ;;
+  agent|frontend|gateway|all) ;;
   *) usage ;;
 esac
 
@@ -210,16 +210,16 @@ case "$1" in
   frontend)
     deploy_one "frontend" "frontend/Dockerfile"
     ;;
+  gateway)
+    deploy_one "gateway" "gateway/Dockerfile"
+    ;;
   all)
-    # Agent first so the frontend's first request to the agent ALB
-    # finds a live target. Both services tolerate the other being down
-    # for a few minutes (Chainlit boots and shows the login form even
-    # if the agent isn't up; the agent doesn't need the frontend at
-    # all), so the order is a small optimization, not a hard
-    # dependency. Sandbox is built last; it has no service to roll
-    # out, so the order doesn't matter — putting it last keeps the
-    # output flow predictable.
+    # Order: agent (sets up Cloud Map registration) → gateway (depends
+    # on agent's Cloud Map name being resolvable) → frontend (depends
+    # on gateway ALB serving traffic). Sandbox last; no service to
+    # roll out, ordering doesn't matter.
     deploy_one "agent" "agent/Dockerfile"
+    deploy_one "gateway" "gateway/Dockerfile"
     deploy_one "frontend" "frontend/Dockerfile"
     "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy_sandbox.sh"
     ;;

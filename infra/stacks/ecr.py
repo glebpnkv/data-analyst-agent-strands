@@ -27,6 +27,7 @@ from constructs import Construct
 AGENT_REPO_NAME = "data-analyst-agent/agent"
 FRONTEND_REPO_NAME = "data-analyst-agent/frontend"
 SANDBOX_REPO_NAME = "data-analyst-agent/sandbox"
+GATEWAY_REPO_NAME = "data-analyst-agent/gateway"
 
 
 class EcrStack(cdk.Stack):
@@ -72,6 +73,15 @@ class EcrStack(cdk.Stack):
             **common,
         )
 
+        # Session-affinity gateway (HAProxy) — sits between frontend
+        # and agent, routes /v1/chat by consistent hash on X-Session-Id.
+        self.gateway_repo = ecr.Repository(
+            self,
+            "GatewayRepo",
+            repository_name=GATEWAY_REPO_NAME,
+            **common,
+        )
+
         # SSM Parameter Store is the indirection point; deploy.sh reads
         # repo URIs from SSM rather than parsing CloudFormation outputs.
         # We write these from THIS stack (not Compute) so that
@@ -96,6 +106,12 @@ class EcrStack(cdk.Stack):
             parameter_name=f"{ssm_prefix}/sandbox/repo-uri",
             string_value=self.sandbox_repo.repository_uri,
         )
+        ssm.StringParameter(
+            self,
+            "GatewayRepoUriParam",
+            parameter_name=f"{ssm_prefix}/gateway/repo-uri",
+            string_value=self.gateway_repo.repository_uri,
+        )
 
         # CFN outputs for human inspection of the deployed stack.
         cdk.CfnOutput(
@@ -115,4 +131,10 @@ class EcrStack(cdk.Stack):
             "SandboxRepoUri",
             value=self.sandbox_repo.repository_uri,
             description="`docker push` this URI to publish a new sandbox image",
+        )
+        cdk.CfnOutput(
+            self,
+            "GatewayRepoUri",
+            value=self.gateway_repo.repository_uri,
+            description="`docker push` this URI to publish a new gateway (HAProxy) image",
         )
