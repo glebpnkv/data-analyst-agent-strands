@@ -30,6 +30,17 @@ Optional fields (used by M3 checks):
 - `negative_assertions`: things the agent must NOT do.
 - `judge_rubric`: criteria for an LLM judge.
 
+## Publishing to Phoenix
+
+The goldens live in git, but the runner reads them from Phoenix. After editing or adding a golden:
+
+```bash
+export PHOENIX_ENDPOINT=http://localhost:6006   # default
+uv run --group dev python scripts/upload_dataset.py --append
+```
+
+First-time upload (no existing dataset) omits `--append`. The runner (`eval/run.py`) then reads `data-analyst-goldens` from Phoenix and posts each experiment run there.
+
 ## Sourcing
 
 - **InfiAgent-DABench-style** cases: open-source data analysis benchmark, constraint-based ground truth. Cite the source in the `context` field.
