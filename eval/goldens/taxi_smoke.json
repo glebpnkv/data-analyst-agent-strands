@@ -1,0 +1,23 @@
+[
+  {
+    "id": "taxi-vendor-distinct-count",
+    "tags": ["athena", "taxi", "aggregation", "smoke"],
+    "input": "How many distinct vendor_id values appear in eval_taxi.taxi_trips?",
+    "expected_answer_contains": ["2"],
+    "context": [
+      "TLC schema documents exactly two vendors: vendor_id 1 (Creative Mobile Technologies) and vendor_id 2 (VeriFone Inc.).",
+      "Stable across months — substring check on '2' is robust unless the agent fabricates a different number."
+    ]
+  },
+  {
+    "id": "taxi-most-common-payment",
+    "tags": ["athena", "taxi", "aggregation", "smoke"],
+    "input": "What payment_type value occurs most often in eval_taxi.taxi_trips?",
+    "expected_answer_contains": ["1"],
+    "context": [
+      "Per TLC codebook: 1=credit card, 2=cash, 3=no charge, 4=dispute, 5=unknown, 6=voided.",
+      "Credit card (1) dominates every recent month with a wide margin. Substring '1' will match whether the agent reports '1' or 'payment_type 1' or 'credit card (1)'.",
+      "LLM judge will catch agents that report '1' but interpret it incorrectly (e.g. as 'cash')."
+    ]
+  }
+]
