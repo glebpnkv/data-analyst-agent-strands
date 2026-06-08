@@ -83,7 +83,6 @@ def main() -> int:
     phoenix_client = _phoenix_client()
 
     dataset = _load_dataset_or_exit(phoenix_client, args.dataset)
-    _shim_node_id_onto_examples(dataset)
     log.info(
         "Phoenix dataset %r resolved (id=%s, %d example(s))",
         args.dataset,
@@ -173,27 +172,6 @@ def _load_dataset_or_exit(client, name: str):
             e,
         )
         sys.exit(2)
-
-
-def _shim_node_id_onto_examples(dataset) -> None:
-    """Work around Phoenix client/server version skew.
-
-    Phoenix client 2.x's experiment runner reads `example["node_id"]`
-    when posting each task run; the field was added server-side in
-    Phoenix ~14. Our deployed Phoenix is 11.4 and returns examples with
-    `id` only — but that `id` IS the GraphQL global ID (the value the
-    newer server populates `node_id` with). So copy id → node_id on
-    each example in place. Drop this shim when the Phoenix server is
-    bumped past v14.
-    """
-    examples = getattr(dataset, "examples", None) or []
-    patched = 0
-    for ex in examples:
-        if isinstance(ex, dict) and "node_id" not in ex and "id" in ex:
-            ex["node_id"] = ex["id"]
-            patched += 1
-    if patched:
-        log.debug("shimmed node_id onto %d dataset example(s)", patched)
 
 
 # --- task + evaluator construction ------------------------------------------
@@ -291,28 +269,35 @@ def _git_branch() -> str:
         return ""
 
 
-def _all_passed(ran) -> bool:
-    """True if every task succeeded AND every evaluator scored 1.0.
+def _g(obj: Any, key: str, default: Any = None) -> Any:
+    """Read `key` off `obj` whether it's a dict, TypedDict, or dataclass.
 
-    Phoenix's RanExperiment is a TypedDict (dict subclass) with
-    `task_runs` (list of ExperimentRun TypedDicts) and `evaluation_runs`
-    (list of ExperimentEvaluationRun TypedDicts, one per (run, evaluator)
-    pair). A task with `error` set never produces evaluations, so we
-    have to check both lists.
+    Phoenix's client mixes TypedDicts (RanExperiment, ExperimentRun,
+    ExperimentEvaluation) with dataclasses (ExperimentEvaluationRun) —
+    so a single experiment's nested data needs both `[k]` and `.k`
+    depending on which layer you're at. This unifies them.
     """
-    task_runs = ran.get("task_runs") or []
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _all_passed(ran) -> bool:
+    """True if every task succeeded AND every evaluator scored 1.0."""
+    task_runs = _g(ran, "task_runs") or []
     if not task_runs:
         return False
-    if any(r.get("error") for r in task_runs):
+    if any(_g(r, "error") for r in task_runs):
         return False
-    eval_runs = ran.get("evaluation_runs") or []
+    eval_runs = _g(ran, "evaluation_runs") or []
     if not eval_runs:
         return False
     for er in eval_runs:
-        if er.get("error"):
+        if _g(er, "error"):
             return False
-        result = er.get("result") or {}
-        score = result.get("score") if isinstance(result, dict) else None
+        score = _g(_g(er, "result"), "score")
         if score is None or float(score) < 1.0:
             return False
     return True
@@ -341,34 +326,25 @@ def _write_local_report(
 
 
 def _summarise_for_report(ran) -> dict[str, Any]:
-    """Per-task pass/fail counts from the flat evaluation_runs list.
-
-    `evaluation_runs` is keyed off `experiment_run_id`; we group by it
-    and a task passes only if every evaluator on it scored 1.0 with no
-    error, and the task itself didn't error out.
-    """
-    task_runs = ran.get("task_runs") or []
-    eval_runs = ran.get("evaluation_runs") or []
+    """Per-task pass/fail counts grouped via experiment_run_id."""
+    task_runs = _g(ran, "task_runs") or []
+    eval_runs = _g(ran, "evaluation_runs") or []
     total = len(task_runs)
-    errored_run_ids = {r["id"] for r in task_runs if r.get("error")}
+    errored_run_ids = {_g(r, "id") for r in task_runs if _g(r, "error")}
 
-    evals_by_run: dict[str, list[dict[str, Any]]] = {}
+    evals_by_run: dict[str, list[Any]] = {}
     for er in eval_runs:
-        evals_by_run.setdefault(er.get("experiment_run_id", ""), []).append(er)
+        evals_by_run.setdefault(_g(er, "experiment_run_id", ""), []).append(er)
 
     passed = 0
     for r in task_runs:
-        if r["id"] in errored_run_ids:
+        rid = _g(r, "id")
+        if rid in errored_run_ids:
             continue
-        ers = evals_by_run.get(r["id"]) or []
-        if not ers:
+        ers = evals_by_run.get(rid) or []
+        if not ers or any(_g(er, "error") for er in ers):
             continue
-        if any(er.get("error") for er in ers):
-            continue
-        scores = [
-            (er.get("result") or {}).get("score") if isinstance(er.get("result"), dict) else None
-            for er in ers
-        ]
+        scores = [_g(_g(er, "result"), "score") for er in ers]
         if all(s is not None and float(s) >= 1.0 for s in scores):
             passed += 1
 

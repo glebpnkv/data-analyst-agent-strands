@@ -80,7 +80,7 @@ PHOENIX_TASK_MEMORY_MIB = 2048  # 2 GB
 # Phoenix's Docker Hub tag convention is "version-X.Y.Z", NOT bare
 # semver. Verify the available tags at
 # https://hub.docker.com/r/arizephoenix/phoenix/tags before bumping.
-PHOENIX_IMAGE_TAG = "version-11.4.0"
+PHOENIX_IMAGE_TAG = "version-17.2.0"
 PHOENIX_DATABASE_NAME = "phoenix"  # logical DB on the existing RDS instance
 
 # Defaults if cdk.json doesn't override; bound the runtime within
