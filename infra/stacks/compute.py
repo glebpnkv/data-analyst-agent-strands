@@ -746,6 +746,35 @@ class ComputeStack(cdk.Stack):
         ).subnet_ids
         sandbox_subnet_ids_csv = cdk.Fn.join(",", private_subnet_ids)
 
+        # Context-sourced env values that have a fallback inside the
+        # agent container's bundled `.env` file. The README's documented
+        # workflow expects `.env` to be the source of truth — values in
+        # cdk.json (or `--context key=val`) are only meant as
+        # per-environment overrides.
+        #
+        # We MUST drop empty values from this dict before passing to
+        # ECS: python-dotenv (called at container startup) won't
+        # override an env var that's already set, even if its value is
+        # the empty string. Emitting an empty `GLUE_JOB_ROLE_ARN=""`
+        # would shadow the value from `.env` and the agent would prompt
+        # the user for a role on every Glue authoring turn. Filter
+        # before merge so only context-set keys reach ECS — `.env`
+        # supplies the rest.
+        context_env = {
+            "MODEL_ID": self.node.try_get_context("model_id"),
+            "GLUE_JOB_ROLE_ARN": self.node.try_get_context("glue_job_role_arn"),
+            "SCHEDULER_ATHENA_EXEC_ROLE_ARN": self.node.try_get_context("scheduler_athena_exec_role_arn"),
+            "GLUE_JOB_DEFAULT_SCRIPT_S3": self.node.try_get_context("glue_job_default_script_s3"),
+            "GLUE_TEMP_DIR": self.node.try_get_context("glue_temp_dir"),
+            "ATHENA_DATABASE": self.node.try_get_context("athena_database"),
+            "ATHENA_TABLE": self.node.try_get_context("athena_table"),
+            "TARGET_REPO_OWNER": self.node.try_get_context("target_repo_owner"),
+            "TARGET_REPO_NAME": self.node.try_get_context("target_repo_name"),
+            "TARGET_REPO_DEFAULT_BRANCH": self.node.try_get_context("target_repo_default_branch"),
+            "RAW_DATA_BUCKET_S3_URI": self.node.try_get_context("raw_data_bucket_s3_uri"),
+        }
+        context_env_set = {k: v for k, v in context_env.items() if v}
+
         agent_task_def.add_container(
             "agent",
             container_name="agent",
@@ -762,17 +791,7 @@ class ComputeStack(cdk.Stack):
             ],
             environment={
                 "AWS_REGION": self.region,
-                "MODEL_ID": self.node.try_get_context("model_id") or "",
-                "GLUE_JOB_ROLE_ARN": self.node.try_get_context("glue_job_role_arn") or "",
-                "SCHEDULER_ATHENA_EXEC_ROLE_ARN": self.node.try_get_context("scheduler_athena_exec_role_arn") or "",
-                "GLUE_JOB_DEFAULT_SCRIPT_S3": self.node.try_get_context("glue_job_default_script_s3") or "",
-                "GLUE_TEMP_DIR": self.node.try_get_context("glue_temp_dir") or "",
-                "ATHENA_DATABASE": self.node.try_get_context("athena_database") or "",
-                "ATHENA_TABLE": self.node.try_get_context("athena_table") or "",
-                "TARGET_REPO_OWNER": self.node.try_get_context("target_repo_owner") or "",
-                "TARGET_REPO_NAME": self.node.try_get_context("target_repo_name") or "",
-                "TARGET_REPO_DEFAULT_BRANCH": self.node.try_get_context("target_repo_default_branch") or "main",
-                "RAW_DATA_BUCKET_S3_URI": self.node.try_get_context("raw_data_bucket_s3_uri") or "",
+                **context_env_set,
                 "AGENT_LOG_LEVEL": "INFO",
                 # ----- Sandbox pool wiring (CDK-resolved, no runtime SSM lookups) -----
                 "SANDBOX_CLUSTER_NAME": self.cluster.cluster_name,
