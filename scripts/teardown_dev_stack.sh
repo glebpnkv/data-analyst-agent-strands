@@ -186,7 +186,59 @@ if [[ -n "${SANDBOX_CLUSTER}" ]]; then
 fi
 
 cd "${INFRA_DIR}"
-cdk destroy --all --force
+
+# Retry wrapper around `cdk destroy`. Why: cdk's underlying AWS SDK has
+# a 300000ms (5-min) per-request timeout. RDS instance deletion takes
+# 5-15 min, so one of cdk's wait-on-RDS requests can exceed that
+# ceiling — the deletion succeeds server-side, but the cdk CLI's
+# polling loop loses the thread and stalls before advancing to the
+# remaining stacks (you see "@smithy/node-http-handler ... exceeded the
+# configured 300000 ms requestTimeout"). cdk destroy is idempotent —
+# re-running skips already-deleted stacks and resumes — so we just loop
+# until either everything's gone or we hit the attempt cap.
+TEARDOWN_MAX_ATTEMPTS="${TEARDOWN_MAX_ATTEMPTS:-4}"
+
+live_project_stacks() {
+  aws cloudformation list-stacks \
+    --region "${REGION}" \
+    --stack-status-filter \
+        CREATE_COMPLETE CREATE_IN_PROGRESS \
+        UPDATE_COMPLETE UPDATE_IN_PROGRESS \
+        UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE \
+        UPDATE_ROLLBACK_FAILED ROLLBACK_FAILED \
+        DELETE_IN_PROGRESS DELETE_FAILED \
+    --query "StackSummaries[?starts_with(StackName, \`${STACK_PREFIX}\`) && ends_with(StackName, \`-${STAGE}\`)].StackName" \
+    --output text 2>/dev/null || true
+}
+
+attempt=1
+while true; do
+  echo
+  echo "==> cdk destroy attempt ${attempt}/${TEARDOWN_MAX_ATTEMPTS}..."
+  # Don't let a non-zero exit (e.g. the smithy timeout) abort the
+  # script under `set -e` — we inspect remaining stacks ourselves.
+  cdk destroy --all --force || echo "    [warn] cdk destroy exited non-zero (likely the SDK request timeout); will re-check stacks."
+
+  STILL_LIVE="$(live_project_stacks)"
+  if [[ -z "${STILL_LIVE// /}" ]]; then
+    echo "    All project stacks deleted."
+    break
+  fi
+
+  if (( attempt >= TEARDOWN_MAX_ATTEMPTS )); then
+    echo "    [warn] still-live stacks after ${TEARDOWN_MAX_ATTEMPTS} attempts:" >&2
+    for s in ${STILL_LIVE}; do echo "      - ${s}" >&2; done
+    echo "    Falling through to final verification." >&2
+    break
+  fi
+
+  echo "    Still live (cdk likely stalled on a slow delete); retrying:"
+  for s in ${STILL_LIVE}; do echo "      - ${s}"; done
+  # Short settle so any in-flight DELETE_IN_PROGRESS can advance before
+  # the next cdk invocation re-attaches to it.
+  sleep 20
+  attempt=$(( attempt + 1 ))
+done
 
 echo
 echo "Verifying nothing remains..."
