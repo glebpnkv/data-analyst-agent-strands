@@ -109,6 +109,82 @@ if [[ -n "${SANDBOX_CLUSTER}" ]]; then
   fi
 fi
 
+# Cloud Map (service discovery) cleanup — added with the M1.5 gateway.
+# The agent ECS service registers each task as an instance in the
+# `dataanalyst.local` private DNS namespace (for the session-affinity
+# gateway). CloudFormation owns the Cloud Map *service* and *namespace*,
+# but the per-task *instances* are created by ECS at runtime, and ECS
+# deregisters them asynchronously when tasks stop. If CFN tries to
+# delete the namespace before that async deregistration finishes, it
+# fails with "Namespace has associated services" / "Service contains
+# registered instances" and the Compute stack deletion hangs — exactly
+# what bit us during the M1.5 gateway rollback.
+#
+# Defuse it: scale the agent service to 0 so nothing re-registers, wait
+# for it to drain, then explicitly deregister any lingering instances.
+# We deliberately do NOT delete the Cloud Map service/namespace here —
+# those are CFN-managed, and deleting them out of band would make
+# `cdk destroy` fail with "resource not found". We only clear the
+# runtime-created instances that block the CFN deletion.
+if [[ -n "${SANDBOX_CLUSTER}" ]]; then
+  AGENT_SERVICE="$(
+    aws ssm get-parameter \
+      --region "${REGION}" \
+      --name "/data-analyst-agent/$(echo "${STAGE}" | tr '[:upper:]' '[:lower:]')/agent/service-name" \
+      --query 'Parameter.Value' --output text 2>/dev/null || true
+  )"
+  if [[ -n "${AGENT_SERVICE}" && "${AGENT_SERVICE}" != "None" ]]; then
+    echo "Scaling agent service ${AGENT_SERVICE} to 0 (drains Cloud Map registrations)..."
+    aws ecs update-service \
+      --region "${REGION}" \
+      --cluster "${SANDBOX_CLUSTER}" \
+      --service "${AGENT_SERVICE}" \
+      --desired-count 0 \
+      --output text >/dev/null 2>&1 || true
+    echo "  waiting for agent tasks to stop..."
+    aws ecs wait services-stable \
+      --region "${REGION}" \
+      --cluster "${SANDBOX_CLUSTER}" \
+      --services "${AGENT_SERVICE}" 2>/dev/null || true
+  fi
+
+  echo "Deregistering any lingering Cloud Map instances in dataanalyst.local..."
+  CLOUDMAP_NS_ID="$(
+    aws servicediscovery list-namespaces \
+      --region "${REGION}" \
+      --query "Namespaces[?Name=='dataanalyst.local'].Id" \
+      --output text 2>/dev/null || true
+  )"
+  if [[ -n "${CLOUDMAP_NS_ID// /}" && "${CLOUDMAP_NS_ID}" != "None" ]]; then
+    for svc_id in $(
+      aws servicediscovery list-services \
+        --region "${REGION}" \
+        --filters "Name=NAMESPACE_ID,Values=${CLOUDMAP_NS_ID},Condition=EQ" \
+        --query 'Services[].Id' --output text 2>/dev/null || true
+    ); do
+      for inst_id in $(
+        aws servicediscovery list-instances \
+          --region "${REGION}" \
+          --service-id "${svc_id}" \
+          --query 'Instances[].Id' --output text 2>/dev/null || true
+      ); do
+        echo "  - deregister ${svc_id}/${inst_id}"
+        aws servicediscovery deregister-instance \
+          --region "${REGION}" \
+          --service-id "${svc_id}" \
+          --instance-id "${inst_id}" \
+          --output text >/dev/null 2>&1 || true
+      done
+    done
+    # Give async deregistration a moment to propagate before CFN tries
+    # to delete the Cloud Map service + namespace.
+    echo "  waiting 15s for deregistration to propagate..."
+    sleep 15
+  else
+    echo "  (no dataanalyst.local namespace found — nothing to do)"
+  fi
+fi
+
 cd "${INFRA_DIR}"
 cdk destroy --all --force
 
