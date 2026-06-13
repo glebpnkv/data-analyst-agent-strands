@@ -21,6 +21,8 @@ dependencies = [
 
     # Observability
     "openinference-instrumentation-bedrock>=0.1.35",
+    "openinference-instrumentation-strands-agents>=0.1.2",
+    "arize-phoenix-otel>=0.13.0",
 
     # FastAPI agent service
     "fastapi>=0.115.0",
@@ -46,6 +48,17 @@ dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.15.5",
+    # Eval runner (scripts/upload_dataset.py + eval/run.py experiments
+    # mode). Only the runner needs the full Phoenix client + experiments
+    # API; the deployed agent only exports OTLP and so just needs
+    # arize-phoenix-otel from runtime deps.
+    "arize-phoenix>=10.0.0",
+    "arize-phoenix-client>=2.0.0",
+    # Routes Phoenix's LLM-judge evaluators (CorrectnessEvaluator,
+    # custom create_classifier judges, etc.) through Bedrock. boto3 is
+    # already present; litellm fills in the Bedrock client adapter
+    # Phoenix's LLM wrapper expects.
+    "litellm>=1.55.0",
 ]
 
 [tool.pytest.ini_options]

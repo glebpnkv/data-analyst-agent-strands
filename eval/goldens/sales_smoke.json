@@ -1,0 +1,24 @@
+[
+  {
+    "id": "sales-revenue-by-category",
+    "tags": ["athena", "sales", "join", "aggregation"],
+    "input": "In the eval_sales database, what is the total revenue per product category across all orders? Which category is the largest?",
+    "expected_answer_contains": ["services"],
+    "context": [
+      "eval_sales.orders joined to eval_sales.products on product_id, then SUM(line_total) GROUP BY category.",
+      "Deterministic (seed=42): services ≈ $42.07M, hardware ≈ $22.72M, software ≈ $2.52M, subscription ≈ $0.63M.",
+      "Services wins because the synthetic price range for that category is the widest ($1k–$10k). Substring check pins on the category name; LLM judge will assess whether the agent gave a faithful breakdown."
+    ]
+  },
+  {
+    "id": "sales-top-region-by-revenue",
+    "tags": ["athena", "sales", "join", "smoke"],
+    "input": "Joining eval_sales.orders to eval_sales.customers, which region has the highest total order revenue?",
+    "expected_answer_contains": ["EMEA"],
+    "context": [
+      "orders ⋈ customers on customer_id, then SUM(line_total) GROUP BY region.",
+      "Deterministic (seed=42): EMEA ≈ $34.92M, AMER ≈ $21.55M, APAC ≈ $11.48M.",
+      "EMEA wins because the customer-region distribution is weighted 50% EMEA / 30% AMER / 20% APAC and orders are uniformly assigned."
+    ]
+  }
+]

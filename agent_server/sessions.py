@@ -86,6 +86,25 @@ class SessionRegistry:
             log.info("created session %s (active=%d)", sid, len(self._sessions))
             return session
 
+    async def delete(self, session_id: str) -> bool:
+        """Explicitly end a session, releasing its resources immediately.
+
+        Idle TTL (session_ttl_seconds) is the only other way a session
+        terminates outside of app shutdown; for callers that know the
+        conversation is finished (eval runners, batch clients, /chat
+        wrappers that detect end-of-turn out-of-band) this short-circuits
+        the wait and frees the claimed sandbox / MCP subprocesses now.
+        Idempotent: returns True if a session was found and torn down,
+        False if it was already gone.
+        """
+        async with self._registry_lock:
+            session = self._sessions.pop(session_id, None)
+            if session is None:
+                return False
+            log.info("explicit close of session %s (active=%d)", session_id, len(self._sessions))
+            await self._safe_teardown(session.managed)
+            return True
+
     async def shutdown(self) -> None:
         async with self._registry_lock:
             for sid, session in list(self._sessions.items()):

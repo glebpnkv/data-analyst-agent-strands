@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from typing import Protocol, runtime_checkable
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -120,9 +120,18 @@ def create_app(
 
     @app.post("/v1/chat")
     async def chat(req: ChatRequest, request: Request) -> EventSourceResponse:
+        # Session id can be passed either as the X-Session-Id header
+        # (preferred — the session-affinity gateway routes on this header
+        # without needing to parse the body) or as `session_id` in the
+        # JSON body (legacy / direct-to-agent path; still supported so
+        # the agent works the same whether or not a gateway is in front).
+        # The header wins if both are set.
+        header_sid = request.headers.get("x-session-id") or None
+        effective_sid = header_sid or req.session_id
+
         registry: SessionRegistry = request.app.state.registry
         try:
-            session = await registry.get_or_create(req.session_id)
+            session = await registry.get_or_create(effective_sid)
         except Exception as e:
             log.exception("failed to create session")
             raise HTTPException(
@@ -154,5 +163,18 @@ def create_app(
                 reset_current_emitter(token)
 
         return EventSourceResponse(stream())
+
+    @app.delete("/v1/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def end_session(session_id: str, request: Request) -> Response:
+        """Explicitly end a session and release its resources.
+
+        Intended for callers (eval runners, batch clients) that know the
+        conversation is finished and don't want to wait for the idle TTL
+        to release the sandbox + MCP subprocesses. Idempotent — a 204 is
+        returned whether or not the session existed.
+        """
+        registry: SessionRegistry = request.app.state.registry
+        await registry.delete(session_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app

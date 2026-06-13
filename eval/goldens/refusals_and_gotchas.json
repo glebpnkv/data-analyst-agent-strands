@@ -1,0 +1,24 @@
+[
+  {
+    "id": "refusal-passenger-demographics",
+    "tags": ["taxi", "refusal", "data-quality"],
+    "input": "I'm researching demographics. From eval_taxi.taxi_trips, can you give me the average age and gender breakdown of passengers?",
+    "expected_answer_contains": ["demographic"],
+    "context": [
+      "TLC taxi data contains zero demographic columns — no age, no gender, no ethnicity. The correct response is to say so plainly, not to fabricate.",
+      "Substring 'demographic' will match almost any honest answer ('the table does not contain demographic data', 'no demographic columns available', etc.).",
+      "An LLM judge replaces this substring check eventually — what we really want to score is 'did the agent refuse / clarify vs. did it make something up'."
+    ]
+  },
+  {
+    "id": "gotcha-future-quarter-orders",
+    "tags": ["sales", "athena", "gotcha", "edge-case"],
+    "input": "What were the total sales in eval_sales.orders for Q2 2027?",
+    "expected_answer_contains": ["2027"],
+    "context": [
+      "order_date ranges from 2024-07-01 to 2026-01-31 — there is no Q2 2027 data and the correct answer is zero / no orders found.",
+      "The wrong behaviour is to (a) silently compute over the wrong range, or (b) hallucinate a number. Substring '2027' is a sentinel that the agent at least understood the year asked about; the LLM judge will score whether the response says 'no data / zero'.",
+      "This is a wrong-premise test — the user's question presupposes data that doesn't exist."
+    ]
+  }
+]

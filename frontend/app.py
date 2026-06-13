@@ -138,13 +138,48 @@ async def on_chat_start() -> None:
     cl.user_session.set("agent_session_id", uuid.uuid4().hex)
 
 
+@cl.on_chat_end
+async def on_chat_end() -> None:
+    """Release the agent-side session when the user closes the tab / chat.
+
+    Without this, the agent's SessionRegistry holds the entry until its
+    idle TTL fires (~10 min), pinning the claimed sandbox + MCP
+    subprocesses + ENI. With sandbox_pool_size=1 and a small ASG, a few
+    orphan tabs are enough to exhaust cluster memory and refuse new
+    sandboxes. DELETE /v1/sessions/{id} is idempotent (204 either way),
+    so worst case is a no-op when the session was already evicted.
+    """
+    session_id = cl.user_session.get("agent_session_id")
+    if not session_id:
+        return
+    url = f"{AGENT_BASE_URL}/v1/sessions/{session_id}"
+    headers = {"X-Session-Id": session_id}
+    if AGENT_SERVICE_AUTH_SECRET:
+        headers["X-Service-Auth"] = AGENT_SERVICE_AUTH_SECRET
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
+            await client.delete(url, headers=headers)
+    except Exception as e:  # noqa: BLE001
+        # Cleanup failure is non-fatal — idle TTL will reap the session
+        # eventually. We just log so the slow-leak case is visible.
+        log.warning("on_chat_end: failed to release agent session %s: %s", session_id, e)
+
+
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     session_id = cl.user_session.get("agent_session_id") or uuid.uuid4().hex
     cl.user_session.set("agent_session_id", session_id)
 
     body = {"session_id": session_id, "prompt": message.content}
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        # X-Session-Id duplicates body.session_id but lets the session-
+        # affinity gateway in front of the agent service route on header
+        # alone (no body inspection). When the gateway isn't in front
+        # the agent reads it and prefers it over the body field.
+        "X-Session-Id": session_id,
+    }
     if AGENT_SERVICE_AUTH_SECRET:
         headers["X-Service-Auth"] = AGENT_SERVICE_AUTH_SECRET
 

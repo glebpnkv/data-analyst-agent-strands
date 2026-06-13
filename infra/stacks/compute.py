@@ -52,6 +52,7 @@ from aws_cdk import aws_rds as rds
 from aws_cdk import aws_route53 as route53
 from aws_cdk import aws_route53_targets as route53_targets
 from aws_cdk import aws_secretsmanager as secretsmanager
+from aws_cdk import aws_servicediscovery as servicediscovery
 from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
@@ -60,6 +61,7 @@ from stacks.network import (  # noqa: F401  (reused symbols)
     ALB_HTTP_PORT,
     ALB_HTTPS_PORT,
     FRONTEND_HTTP_PORT,
+    PHOENIX_HTTP_PORT,
     SANDBOX_HTTP_PORT,
 )
 
@@ -70,11 +72,38 @@ AGENT_TASK_CPU = 512  # 0.5 vCPU
 AGENT_TASK_MEMORY_MIB = 1024  # 1 GB
 FRONTEND_TASK_CPU = 256  # 0.25 vCPU
 FRONTEND_TASK_MEMORY_MIB = 512  # 0.5 GB
+PHOENIX_TASK_CPU = 512  # 0.5 vCPU
+PHOENIX_TASK_MEMORY_MIB = 2048  # 2 GB
+GATEWAY_TASK_CPU = 128  # 1/8 vCPU — HAProxy is feather-light
+GATEWAY_TASK_MEMORY_MIB = 256  # 256 MB — connection counts here are tiny
+
+# Cloud Map private DNS namespace under which the agent service
+# registers each task as an A record. The gateway resolves
+# `<service>.<namespace>` and consistent-hashes incoming requests
+# across the resulting IPs. Namespace lives only inside the VPC.
+CLOUDMAP_NAMESPACE = "dataanalyst.local"
+AGENT_CLOUDMAP_SERVICE = "agent"  # → agent.dataanalyst.local
+
+# Phoenix container tag. Pinned for reproducibility; bump deliberately
+# after reading the release notes — Phoenix's storage schema migrates
+# at container boot under a write lock, so a rollback isn't free.
+# Phoenix's Docker Hub tag convention is "version-X.Y.Z", NOT bare
+# semver. Verify the available tags at
+# https://hub.docker.com/r/arizephoenix/phoenix/tags before bumping.
+PHOENIX_IMAGE_TAG = "version-17.2.0"
+PHOENIX_DATABASE_NAME = "phoenix"  # logical DB on the existing RDS instance
 
 # Defaults if cdk.json doesn't override; bound the runtime within
 # small-dev-friendly ranges. Per-deploy override via `cdk deploy --context key=value`.
 DEFAULT_ASG_INSTANCE_TYPE = "t3.medium"
-DEFAULT_ASG_MIN = 2
+# 4-instance design: 1 instance for agent+frontend, 1 for Phoenix
+# (added M1), 1 for the warm sandbox, 1 for headroom so the pool can
+# refill while a session has a sandbox claimed. Three instances would
+# leave nowhere for pool refill to land — and ECS managed scaling
+# doesn't kick in on synchronous RunTask RESOURCE:MEMORY failures.
+# cdk.json overrides this with the same value; the code default keeps
+# things sane if cdk.json is bypassed (CI synth from a clean tree, etc.).
+DEFAULT_ASG_MIN = 4
 DEFAULT_ASG_MAX = 8
 DEFAULT_SANDBOX_POOL_SIZE = 2
 DEFAULT_SANDBOX_CPU = 1024  # 1 vCPU
@@ -94,9 +123,14 @@ class ComputeStack(cdk.Stack):
         frontend_alb_sg: ec2.ISecurityGroup,
         frontend_task_sg: ec2.ISecurityGroup,
         sandbox_task_sg: ec2.ISecurityGroup,
+        phoenix_alb_sg: ec2.ISecurityGroup,
+        phoenix_task_sg: ec2.ISecurityGroup,
+        gateway_alb_sg: ec2.ISecurityGroup,
+        gateway_task_sg: ec2.ISecurityGroup,
         agent_repo: ecr.IRepository,
         frontend_repo: ecr.IRepository,
         sandbox_repo: ecr.IRepository,
+        gateway_repo: ecr.IRepository,
         db_instance: rds.IDatabaseInstance,
         db_secret: secretsmanager.ISecret,
         hosted_zone: route53.IHostedZone,
@@ -122,6 +156,14 @@ class ComputeStack(cdk.Stack):
         sandbox_memory_mib = int(
             self.node.try_get_context("sandbox_memory_mib") or DEFAULT_SANDBOX_MEMORY_MIB
         )
+        # Phoenix desired_count is a context flag so the first-time
+        # bootstrap can deploy Compute with the service "registered but
+        # empty" (count=0), create the phoenix logical DB on RDS via
+        # `scripts/bootstrap_phoenix_db.sh`, then redeploy with the
+        # default (1) to start Phoenix against the now-existing DB.
+        # Steady-state deploys do not set this and get 1.
+        _phoenix_desired = self.node.try_get_context("phoenix_desired_count")
+        phoenix_desired_count = int(_phoenix_desired) if _phoenix_desired is not None else 1
 
         ssm_prefix = f"/data-analyst-agent/{stage.lower()}"
 
@@ -133,6 +175,23 @@ class ComputeStack(cdk.Stack):
             "Cluster",
             vpc=vpc,
             container_insights_v2=ecs.ContainerInsights.DISABLED,
+        )
+
+        # Private Cloud Map DNS namespace. The agent service registers
+        # each running task as an A record under this namespace (e.g.
+        # `agent.dataanalyst.local`); the HAProxy gateway resolves the
+        # name and consistent-hashes incoming /v1/chat requests across
+        # the resulting set of task IPs. Namespace is VPC-scoped — DNS
+        # only resolves from inside the VPC.
+        self.cloudmap_namespace = servicediscovery.PrivateDnsNamespace(
+            self,
+            "CloudMapNamespace",
+            name=CLOUDMAP_NAMESPACE,
+            vpc=vpc,
+            description=(
+                "Internal service discovery for agent ↔ gateway hops. "
+                "Not used for prod traffic into the cluster from outside."
+            ),
         )
 
         # ENI trunking is an account/region-wide ECS setting that is NOT
@@ -385,6 +444,16 @@ class ComputeStack(cdk.Stack):
         # Sandbox lifecycle. Replaces the old AgentCore Code Interpreter
         # block — that namespace is blocked at work, so we run sandboxes
         # ourselves via `ecs:RunTask`.
+        #
+        # ListTasks resources are subtle: ECS authorises ListTasks against
+        # whatever scope you pass on the request. The pool's RunTask path
+        # scopes by task-definition family (resource form `task-definition/<family>:*`),
+        # while the orphan-sweep path scopes by container-instance
+        # (resource form `container-instance/<cluster>/<instance>`). The
+        # latter was missing from the original policy, so the sweep was
+        # failing silently with AccessDeniedException and stranded
+        # sandboxes from prior sessions accumulated until the cluster
+        # ran out of memory.
         agent_task_role.add_to_policy(
             iam.PolicyStatement(
                 sid="SandboxEcsLifecycle",
@@ -401,6 +470,11 @@ class ComputeStack(cdk.Stack):
                     # All running tasks under this cluster (the pool's
                     # ListTasks call narrows to the family at the API level).
                     f"arn:aws:ecs:{self.region}:{self.account}:task/{self.cluster.cluster_name}/*",
+                    # All container instances under this cluster. The
+                    # orphan-sweep ListTasks call filters by
+                    # containerInstance ARN; without this entry that
+                    # filter is denied and the sweep can't run.
+                    f"arn:aws:ecs:{self.region}:{self.account}:container-instance/{self.cluster.cluster_name}/*",
                     # Cluster ARN itself, for ListTasks scoping.
                     self.cluster.cluster_arn,
                 ],
@@ -501,6 +575,152 @@ class ComputeStack(cdk.Stack):
         self.github_pat_secret.grant_read(agent_task_role)
 
         # =====================================================================
+        # PHOENIX: task role, task def, ALB, service
+        # =====================================================================
+        # Self-hosted Arize Phoenix for tracing + offline experiments +
+        # dataset versioning. One container, persisted to a logical DB
+        # on the existing RDS instance (`PHOENIX_DATABASE_NAME`, created
+        # post-deploy via `scripts/bootstrap_phoenix_db.sh` — RDS doesn't
+        # expose CREATE DATABASE as IaC).
+        #
+        # Built BEFORE the agent task def so the agent's OTLP env vars
+        # can reference `self.phoenix_alb.load_balancer_dns_name`.
+        #
+        # Auth is OFF for the initial deploy. Access during dev is via
+        # `aws ssm start-session ... AWS-StartPortForwardingSessionToRemoteHost`
+        # to the Phoenix ALB DNS. Cognito-fronted public UI is a
+        # separate follow-up.
+        phoenix_task_role = iam.Role(
+            self,
+            "PhoenixTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            description="Runtime role for the Phoenix observability ECS task",
+        )
+        db_secret.grant_read(phoenix_task_role)
+
+        phoenix_log_group = logs.LogGroup(
+            self,
+            "PhoenixLogGroup",
+            log_group_name=f"/ecs/data-analyst-agent/{stage.lower()}/phoenix",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+        phoenix_task_def = ecs.Ec2TaskDefinition(
+            self,
+            "PhoenixTaskDef",
+            task_role=phoenix_task_role,
+            network_mode=ecs.NetworkMode.AWS_VPC,
+        )
+
+        phoenix_task_def.add_container(
+            "phoenix",
+            container_name="phoenix",
+            # Pinned tag in PHOENIX_IMAGE_TAG. Bump deliberately —
+            # storage migrations run under a write lock at boot.
+            image=ecs.ContainerImage.from_registry(f"arizephoenix/phoenix:{PHOENIX_IMAGE_TAG}"),
+            cpu=PHOENIX_TASK_CPU,
+            memory_limit_mib=PHOENIX_TASK_MEMORY_MIB,
+            essential=True,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="phoenix",
+                log_group=phoenix_log_group,
+            ),
+            port_mappings=[
+                ecs.PortMapping(container_port=PHOENIX_HTTP_PORT, protocol=ecs.Protocol.TCP),
+            ],
+            environment={
+                # Phoenix bundles UI + OTLP/HTTP ingest at /v1/traces on
+                # one port. We don't use the gRPC OTLP port (4317) — the
+                # ALB stays simple as HTTP-only.
+                "PHOENIX_PORT": str(PHOENIX_HTTP_PORT),
+                "PHOENIX_HOST": "0.0.0.0",
+                "PHOENIX_POSTGRES_DB": PHOENIX_DATABASE_NAME,
+                # Working dir is for transient artifacts only; durable
+                # state goes to Postgres. /tmp is writable in the
+                # arizephoenix container without extra volumes.
+                "PHOENIX_WORKING_DIR": "/tmp/phoenix",
+                # Suppress the first-run telemetry prompt.
+                "PHOENIX_ENABLE_PROMETHEUS": "false",
+            },
+            secrets={
+                # The RDS-generated secret stores credentials as JSON;
+                # we lift individual fields with `field=`. Phoenix accepts
+                # these env vars and constructs its SQLAlchemy URL itself.
+                "PHOENIX_POSTGRES_HOST": ecs.Secret.from_secrets_manager(
+                    db_secret, field="host"
+                ),
+                "PHOENIX_POSTGRES_PORT": ecs.Secret.from_secrets_manager(
+                    db_secret, field="port"
+                ),
+                "PHOENIX_POSTGRES_USER": ecs.Secret.from_secrets_manager(
+                    db_secret, field="username"
+                ),
+                "PHOENIX_POSTGRES_PASSWORD": ecs.Secret.from_secrets_manager(
+                    db_secret, field="password"
+                ),
+            },
+        )
+
+        self.phoenix_alb = elbv2.ApplicationLoadBalancer(
+            self,
+            "PhoenixAlb",
+            vpc=vpc,
+            internet_facing=False,
+            security_group=phoenix_alb_sg,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            idle_timeout=cdk.Duration.seconds(120),
+        )
+
+        phoenix_listener = self.phoenix_alb.add_listener(
+            "PhoenixListener",
+            port=ALB_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            open=False,
+        )
+
+        self.phoenix_service = ecs.Ec2Service(
+            self,
+            "PhoenixService",
+            cluster=self.cluster,
+            task_definition=phoenix_task_def,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            security_groups=[phoenix_task_sg],
+            # Phoenix runs SQL migrations under a write lock at container
+            # boot; first start can take 60-90s. Give generous grace.
+            # Single replica only — concurrent boots would race the lock.
+            # `desired_count` is controllable via context (`phoenix_desired_count`)
+            # so the first-time bootstrap can run with 0 while the
+            # phoenix logical DB is being created on RDS.
+            desired_count=phoenix_desired_count,
+            health_check_grace_period=cdk.Duration.seconds(180),
+            min_healthy_percent=0,
+            max_healthy_percent=100,
+            enable_execute_command=True,
+        )
+
+        phoenix_listener.add_targets(
+            "PhoenixTargets",
+            port=PHOENIX_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            targets=[self.phoenix_service],
+            health_check=elbv2.HealthCheck(
+                # Phoenix returns 200 on `/healthz` once migrations
+                # have completed and the server is accepting traffic.
+                path="/healthz",
+                healthy_http_codes="200",
+                # First-boot migrations can take ~60s. Stretch the
+                # threshold so the target group doesn't flap during
+                # rolling deploys.
+                interval=cdk.Duration.seconds(30),
+                timeout=cdk.Duration.seconds(10),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=5,
+            ),
+            deregistration_delay=cdk.Duration.seconds(15),
+        )
+
+        # =====================================================================
         # AGENT TASK DEF + ECS SERVICE (Ec2 launch type)
         # =====================================================================
         agent_log_group = logs.LogGroup(
@@ -526,6 +746,35 @@ class ComputeStack(cdk.Stack):
         ).subnet_ids
         sandbox_subnet_ids_csv = cdk.Fn.join(",", private_subnet_ids)
 
+        # Context-sourced env values that have a fallback inside the
+        # agent container's bundled `.env` file. The README's documented
+        # workflow expects `.env` to be the source of truth — values in
+        # cdk.json (or `--context key=val`) are only meant as
+        # per-environment overrides.
+        #
+        # We MUST drop empty values from this dict before passing to
+        # ECS: python-dotenv (called at container startup) won't
+        # override an env var that's already set, even if its value is
+        # the empty string. Emitting an empty `GLUE_JOB_ROLE_ARN=""`
+        # would shadow the value from `.env` and the agent would prompt
+        # the user for a role on every Glue authoring turn. Filter
+        # before merge so only context-set keys reach ECS — `.env`
+        # supplies the rest.
+        context_env = {
+            "MODEL_ID": self.node.try_get_context("model_id"),
+            "GLUE_JOB_ROLE_ARN": self.node.try_get_context("glue_job_role_arn"),
+            "SCHEDULER_ATHENA_EXEC_ROLE_ARN": self.node.try_get_context("scheduler_athena_exec_role_arn"),
+            "GLUE_JOB_DEFAULT_SCRIPT_S3": self.node.try_get_context("glue_job_default_script_s3"),
+            "GLUE_TEMP_DIR": self.node.try_get_context("glue_temp_dir"),
+            "ATHENA_DATABASE": self.node.try_get_context("athena_database"),
+            "ATHENA_TABLE": self.node.try_get_context("athena_table"),
+            "TARGET_REPO_OWNER": self.node.try_get_context("target_repo_owner"),
+            "TARGET_REPO_NAME": self.node.try_get_context("target_repo_name"),
+            "TARGET_REPO_DEFAULT_BRANCH": self.node.try_get_context("target_repo_default_branch"),
+            "RAW_DATA_BUCKET_S3_URI": self.node.try_get_context("raw_data_bucket_s3_uri"),
+        }
+        context_env_set = {k: v for k, v in context_env.items() if v}
+
         agent_task_def.add_container(
             "agent",
             container_name="agent",
@@ -542,17 +791,7 @@ class ComputeStack(cdk.Stack):
             ],
             environment={
                 "AWS_REGION": self.region,
-                "MODEL_ID": self.node.try_get_context("model_id") or "",
-                "GLUE_JOB_ROLE_ARN": self.node.try_get_context("glue_job_role_arn") or "",
-                "SCHEDULER_ATHENA_EXEC_ROLE_ARN": self.node.try_get_context("scheduler_athena_exec_role_arn") or "",
-                "GLUE_JOB_DEFAULT_SCRIPT_S3": self.node.try_get_context("glue_job_default_script_s3") or "",
-                "GLUE_TEMP_DIR": self.node.try_get_context("glue_temp_dir") or "",
-                "ATHENA_DATABASE": self.node.try_get_context("athena_database") or "",
-                "ATHENA_TABLE": self.node.try_get_context("athena_table") or "",
-                "TARGET_REPO_OWNER": self.node.try_get_context("target_repo_owner") or "",
-                "TARGET_REPO_NAME": self.node.try_get_context("target_repo_name") or "",
-                "TARGET_REPO_DEFAULT_BRANCH": self.node.try_get_context("target_repo_default_branch") or "main",
-                "RAW_DATA_BUCKET_S3_URI": self.node.try_get_context("raw_data_bucket_s3_uri") or "",
+                **context_env_set,
                 "AGENT_LOG_LEVEL": "INFO",
                 # ----- Sandbox pool wiring (CDK-resolved, no runtime SSM lookups) -----
                 "SANDBOX_CLUSTER_NAME": self.cluster.cluster_name,
@@ -562,6 +801,36 @@ class ComputeStack(cdk.Stack):
                 "SANDBOX_POOL_SIZE": str(sandbox_pool_size),
                 "SANDBOX_PORT": str(SANDBOX_HTTP_PORT),
                 "SANDBOX_CONTAINER_NAME": SANDBOX_CONTAINER_NAME,
+                # ----- Phoenix / OTel wiring -----
+                # Strands' setup_otlp_exporter() reads the standard
+                # OTEL_* vars. http/protobuf because Phoenix takes OTLP
+                # over HTTP at /v1/traces on its UI port — no separate
+                # gRPC port needed.
+                "AGENT_OTLP_ENABLE": "1",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": (
+                    f"http://{self.phoenix_alb.load_balancer_dns_name}"
+                ),
+                # 5s default flush is too laggy for snappy "View trace"
+                # demos; 1s keeps traces appearing while still batching.
+                "OTEL_BSP_SCHEDULE_DELAY": "1000",
+                # Route traces into a named Phoenix project. Phoenix
+                # reads `openinference.project.name` from the OTel
+                # resource attributes (NOT from PHOENIX_PROJECT_NAME —
+                # that var only works via phoenix.otel.register, which
+                # we don't use; Strands uses plain OTel SDK setup).
+                # Stage-suffixed so a future prod/staging deploy lands
+                # in a separate Phoenix project automatically.
+                "OTEL_RESOURCE_ATTRIBUTES": (
+                    f"openinference.project.name=data-analyst-agent-{stage.lower()}"
+                ),
+                # Identifies the build in every span attribute.
+                # `agent_version` context is set by deploy_agent.sh from
+                # `git rev-parse --short HEAD`; fallback to "deployed"
+                # when not provided so we never emit empty.
+                "AGENT_VERSION": (
+                    self.node.try_get_context("agent_version") or "deployed"
+                ),
             },
             secrets={
                 "AGENT_SERVICE_AUTH_SECRET": ecs.Secret.from_secrets_manager(self.service_auth_secret),
@@ -588,6 +857,12 @@ class ComputeStack(cdk.Stack):
 
         # Ec2Service uses the cluster's default capacity provider
         # strategy (set above), so no explicit strategy here.
+        # cloud_map_options registers each agent task IP under
+        # `agent.dataanalyst.local`; the gateway resolves that name and
+        # consistent-hashes /v1/chat across the resulting set. Tasks
+        # auto-deregister when they stop. ALB target registration stays
+        # so ECS can still deploy-gate on ALB health and so the SSM
+        # port-forward path (eval runner) keeps working.
         self.agent_service = ecs.Ec2Service(
             self,
             "AgentService",
@@ -599,6 +874,12 @@ class ComputeStack(cdk.Stack):
             min_healthy_percent=0,  # allow 0 -> 1 transition without rolling-deploy back-pressure
             max_healthy_percent=200,
             enable_execute_command=True,
+            cloud_map_options=ecs.CloudMapOptions(
+                name=AGENT_CLOUDMAP_SERVICE,
+                cloud_map_namespace=self.cloudmap_namespace,
+                dns_record_type=servicediscovery.DnsRecordType.A,
+                dns_ttl=cdk.Duration.seconds(10),
+            ),
         )
 
         agent_listener.add_targets(
@@ -607,6 +888,119 @@ class ComputeStack(cdk.Stack):
             protocol=elbv2.ApplicationProtocol.HTTP,
             targets=[self.agent_service],
             health_check=elbv2.HealthCheck(
+                path="/healthz",
+                healthy_http_codes="200",
+                interval=cdk.Duration.seconds(15),
+                timeout=cdk.Duration.seconds(5),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=3,
+            ),
+            deregistration_delay=cdk.Duration.seconds(15),
+        )
+
+        # =====================================================================
+        # GATEWAY (HAProxy): session-affinity in front of the agent service
+        # =====================================================================
+        # Why this exists: with N>1 agent tasks, the agent ALB's
+        # round-robin LB would scatter a single session's turns across
+        # tasks, and each task only knows about the sessions it has
+        # served. The gateway reads X-Session-Id and consistent-hashes
+        # against the live agent task set (via Cloud Map DNS), so a
+        # session sticks to one task until that task disappears.
+        # See `gateway/haproxy.cfg` for the routing config.
+        gateway_task_role = iam.Role(
+            self,
+            "GatewayTaskRole",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+            description="Runtime role for the HAProxy gateway ECS task (no AWS calls needed)",
+        )
+
+        gateway_log_group = logs.LogGroup(
+            self,
+            "GatewayLogGroup",
+            log_group_name=f"/ecs/data-analyst-agent/{stage.lower()}/gateway",
+            retention=logs.RetentionDays.TWO_WEEKS,
+            removal_policy=cdk.RemovalPolicy.DESTROY,
+        )
+
+        gateway_task_def = ecs.Ec2TaskDefinition(
+            self,
+            "GatewayTaskDef",
+            task_role=gateway_task_role,
+            network_mode=ecs.NetworkMode.AWS_VPC,
+        )
+
+        gateway_task_def.add_container(
+            "gateway",
+            container_name="gateway",
+            image=ecs.ContainerImage.from_ecr_repository(gateway_repo, tag="latest"),
+            cpu=GATEWAY_TASK_CPU,
+            memory_limit_mib=GATEWAY_TASK_MEMORY_MIB,
+            essential=True,
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix="gateway",
+                log_group=gateway_log_group,
+            ),
+            port_mappings=[
+                # 80 = main listener; 8404 = stats + /healthz used by
+                # the gateway ALB's target health check.
+                ecs.PortMapping(container_port=ALB_HTTP_PORT, protocol=ecs.Protocol.TCP),
+                ecs.PortMapping(container_port=8404, protocol=ecs.Protocol.TCP),
+            ],
+            environment={
+                # haproxy.cfg substitutes these into the server-template
+                # backend at startup. Cloud Map FQDN resolves to all
+                # currently-running agent tasks under the namespace.
+                "AGENT_SERVICE_DNS": (
+                    f"{AGENT_CLOUDMAP_SERVICE}.{CLOUDMAP_NAMESPACE}"
+                ),
+                "AGENT_SERVICE_PORT": str(AGENT_HTTP_PORT),
+            },
+        )
+
+        self.gateway_alb = elbv2.ApplicationLoadBalancer(
+            self,
+            "GatewayAlb",
+            vpc=vpc,
+            internet_facing=False,
+            security_group=gateway_alb_sg,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            idle_timeout=cdk.Duration.seconds(120),
+        )
+
+        gateway_listener = self.gateway_alb.add_listener(
+            "GatewayListener",
+            port=ALB_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            open=False,  # SG-controlled
+        )
+
+        self.gateway_service = ecs.Ec2Service(
+            self,
+            "GatewayService",
+            cluster=self.cluster,
+            task_definition=gateway_task_def,
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            security_groups=[gateway_task_sg],
+            health_check_grace_period=cdk.Duration.seconds(30),
+            min_healthy_percent=0,
+            max_healthy_percent=200,
+            enable_execute_command=True,
+        )
+
+        # Health check hits the stats listener on :8404 (which serves
+        # /healthz). HAProxy's main listener (:80) is what carries
+        # production traffic.
+        gateway_listener.add_targets(
+            "GatewayTargets",
+            port=ALB_HTTP_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            targets=[self.gateway_service.load_balancer_target(
+                container_name="gateway",
+                container_port=ALB_HTTP_PORT,
+            )],
+            health_check=elbv2.HealthCheck(
+                port="8404",
                 path="/healthz",
                 healthy_http_codes="200",
                 interval=cdk.Duration.seconds(15),
@@ -662,10 +1056,14 @@ class ComputeStack(cdk.Stack):
             ],
             environment={
                 "AWS_REGION": self.region,
-                # Same-stack reference: agent ALB's DNS resolves to the
-                # internal IP. http://<dns> with no port = port 80, where
-                # the agent's listener forwards to container port 8080.
-                "AGENT_BASE_URL": f"http://{self.agent_alb.load_balancer_dns_name}",
+                # Same-stack reference: gateway ALB's DNS resolves to
+                # the internal IP. http://<dns> with no port = port 80,
+                # where the gateway listens, then HAProxy hashes by
+                # X-Session-Id and forwards to the right agent task.
+                # Direct agent ALB still exists (used by SSM port-forward
+                # for ad-hoc debug); production traffic flows through
+                # the gateway.
+                "AGENT_BASE_URL": f"http://{self.gateway_alb.load_balancer_dns_name}",
                 "AGENT_REQUEST_TIMEOUT_SECONDS": "600",
                 "DB_SECRET_ARN": db_secret.secret_arn,
                 "DEPLOYED_BEHIND_ALB": "1",
@@ -854,6 +1252,46 @@ class ComputeStack(cdk.Stack):
             "SandboxPortParam",
             parameter_name=f"{ssm_prefix}/sandbox/port",
             string_value=str(SANDBOX_HTTP_PORT),
+        )
+
+        # Phoenix params: dev laptop uses these for SSM port-forwarding
+        # to the internal Phoenix ALB during eval / debugging sessions.
+        ssm.StringParameter(
+            self,
+            "PhoenixServiceNameParam",
+            parameter_name=f"{ssm_prefix}/phoenix/service-name",
+            string_value=self.phoenix_service.service_name,
+        )
+        ssm.StringParameter(
+            self,
+            "PhoenixAlbDnsParam",
+            parameter_name=f"{ssm_prefix}/phoenix/alb-dns",
+            string_value=self.phoenix_alb.load_balancer_dns_name,
+        )
+        ssm.StringParameter(
+            self,
+            "PhoenixUiUrlParam",
+            parameter_name=f"{ssm_prefix}/phoenix/ui-url",
+            string_value=f"http://{self.phoenix_alb.load_balancer_dns_name}",
+        )
+        ssm.StringParameter(
+            self,
+            "PhoenixOtlpEndpointParam",
+            parameter_name=f"{ssm_prefix}/phoenix/otlp-endpoint",
+            string_value=f"http://{self.phoenix_alb.load_balancer_dns_name}",
+        )
+
+        ssm.StringParameter(
+            self,
+            "GatewayServiceNameParam",
+            parameter_name=f"{ssm_prefix}/gateway/service-name",
+            string_value=self.gateway_service.service_name,
+        )
+        ssm.StringParameter(
+            self,
+            "GatewayAlbDnsParam",
+            parameter_name=f"{ssm_prefix}/gateway/alb-dns",
+            string_value=self.gateway_alb.load_balancer_dns_name,
         )
 
         # Top-level convenience output: public HTTPS URL behind Cognito.

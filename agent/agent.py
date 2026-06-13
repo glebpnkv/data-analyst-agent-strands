@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import uuid
@@ -6,7 +7,14 @@ from typing import Optional
 
 import boto3
 from mcp import StdioServerParameters, stdio_client
-from mcp.client.streamable_http import streamable_http_client
+# mcp 1.27 split the streamable-HTTP entrypoint into two functions:
+#   - streamablehttp_client(url, headers=..., auth=...) ← what we want
+#   - streamable_http_client(url, http_client=..., terminate_on_close=...)
+#     ← the same NAME we used before the split but no longer accepts
+#     `headers`, hence the TypeError seen at session-creation time.
+# Stay on the canonical name so we can keep passing the bearer token
+# via headers without juggling httpx.Auth instances.
+from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent, AgentSkills
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
@@ -15,6 +23,15 @@ from sandbox_client import RemoteSandboxCodeInterpreter
 from utils.hooks import GlueJobRunPollThrottleHook
 from utils.prompts import SYSTEM_PROMPT
 from utils.tools import make_athena_query_to_ci_csv, make_glue_job_run_diagnostics_tool
+
+# Trace attributes baked onto every Agent span. Lets a deployed trace
+# pivot back to a specific commit / prompt revision / model:
+#   - AGENT_VERSION   build-time git SHA, injected via env on the ECS task
+#   - AGENT_PROMPT_HASH  sha256 of the assembled system prompt (computed)
+#   - AGENT_MODEL_ID  Bedrock model ID at deploy time
+# Read at make_agent() time. session.id / user.id are filled in
+# per-request by the FastAPI layer via OTel context (see agent_server).
+_AGENT_VERSION = os.environ.get("AGENT_VERSION", "local-dev")
 
 ALLOWED_MCP_TOOLS = [
     "manage_aws_athena_databases_and_tables",
@@ -230,7 +247,7 @@ def make_github_mcp_client() -> MCPClient:
     headers = {"Authorization": f"Bearer {pat}"}
 
     return MCPClient(
-        lambda: streamable_http_client(
+        lambda: streamablehttp_client(
             url=GITHUB_MCP_SERVER_URL,
             headers=headers,
         ),
@@ -373,9 +390,21 @@ def make_agent(
     :return: Agent, optional CI session name, optional code interpreter tool
     """
     session = boto3.Session(profile_name=profile, region_name=region)
+    # cache_prompt + cache_tools enable Bedrock prompt caching on the
+    # system prompt (large: base prompt + Glue rules + GitHub rules +
+    # CI handoff rules + Skills tool defs, ~10-15k tokens) and the tool
+    # definitions. Bedrock charges cached input tokens at ~10% of the
+    # base rate ($0.30/1M vs $3/1M on Sonnet 4.5) and cache writes at
+    # ~1.25x the base rate, with a 5-minute default TTL. For multi-turn
+    # eval runs that hit the same system prompt repeatedly within a
+    # session, this cuts input-token cost by ~80-90%. Output tokens are
+    # unchanged. "default" sets the cache breakpoint at the natural
+    # boundary (end of system prompt / end of tool defs).
     model = BedrockModel(
         boto_session=session,
         model_id=model_id,
+        cache_prompt="default",
+        cache_tools="default",
     )
 
     aws_api_mcp_client = make_aws_api_mcp_client()
@@ -428,11 +457,23 @@ def make_agent(
     )
     tools.append(glue_job_run_diagnostics)
 
+    system_prompt = "\n\n".join(prompt_parts)
+    # Stable hash so the same prompt across deploys is identifiable in
+    # traces / eval reports without storing the prompt itself.
+    prompt_hash = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:16]
+
     agent_kwargs = {
         "model": model,
         "tools": tools,
-        "system_prompt": "\n\n".join(prompt_parts),
+        "system_prompt": system_prompt,
         "hooks": hooks,
+        # Baked into every span emitted by this Agent instance. Phoenix /
+        # any OpenInference-aware backend can filter or group by these.
+        "trace_attributes": {
+            "agent.version": _AGENT_VERSION,
+            "agent.prompt_hash": prompt_hash,
+            "agent.model_id": model_id,
+        },
     }
     if skills_plugin is not None:
         agent_kwargs["plugins"] = [skills_plugin]

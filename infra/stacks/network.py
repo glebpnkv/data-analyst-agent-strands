@@ -36,6 +36,7 @@ ALB_HTTPS_PORT = 443
 FRONTEND_HTTP_PORT = 8000
 AGENT_HTTP_PORT = 8080
 SANDBOX_HTTP_PORT = 8081
+PHOENIX_HTTP_PORT = 6006  # Phoenix UI + OTLP/HTTP ingest on /v1/traces
 POSTGRES_PORT = 5432
 
 
@@ -123,8 +124,49 @@ class NetworkStack(cdk.Stack):
             self,
             "RdsSg",
             vpc=self.vpc,
-            description="RDS Postgres for Chainlit Data Layer. Reachable from frontend tasks only.",
+            description="RDS Postgres for Chainlit Data Layer + Phoenix. Reachable from frontend + phoenix tasks.",
             allow_all_outbound=False,
+        )
+
+        # Phoenix: self-hosted Arize Phoenix for tracing + offline
+        # experiments. Internal ALB only — UI access during dev is via
+        # SSM port-forward; public Cognito-fronted access is a separate
+        # workstream. OTLP/HTTP traces from the agent come in via the
+        # same ALB at /v1/traces.
+        self.phoenix_alb_sg = ec2.SecurityGroup(
+            self,
+            "PhoenixAlbSg",
+            vpc=self.vpc,
+            description="Phoenix internal ALB. Accepts OTLP traces from agent tasks + UI from frontend tasks.",
+            allow_all_outbound=True,
+        )
+
+        self.phoenix_task_sg = ec2.SecurityGroup(
+            self,
+            "PhoenixTaskSg",
+            vpc=self.vpc,
+            description="Phoenix ECS task. Reachable from the Phoenix ALB only; egresses to RDS for storage.",
+            allow_all_outbound=True,
+        )
+
+        # Session-affinity gateway (HAProxy). Sits between frontend
+        # tasks and agent tasks; routes /v1/chat by consistent hash on
+        # the X-Session-Id header so the same session always lands on
+        # the same agent task while it's healthy.
+        self.gateway_alb_sg = ec2.SecurityGroup(
+            self,
+            "GatewayAlbSg",
+            vpc=self.vpc,
+            description="Gateway (HAProxy) ALB. Accepts traffic from frontend tasks + VPC for SSM port-forward.",
+            allow_all_outbound=True,
+        )
+
+        self.gateway_task_sg = ec2.SecurityGroup(
+            self,
+            "GatewayTaskSg",
+            vpc=self.vpc,
+            description="Gateway (HAProxy) ECS tasks. Reachable from gateway ALB; talks to agent tasks directly via Cloud Map.",
+            allow_all_outbound=True,
         )
 
         # ---- Pairwise ingress rules ----------------------------------------
@@ -172,6 +214,19 @@ class NetworkStack(cdk.Stack):
             description="Agent ALB to agent tasks",
         )
 
+        # Dev: VPC-internal sources reach the agent ALB. Mirrors the
+        # Phoenix ALB rule — covers the SSM port-forward path through
+        # ECS EC2 hosts (used by the eval runner and ad-hoc curl
+        # against /v1/chat). Agent ALB is internal-only (private
+        # subnets, internet_facing=False); the VPC is the network
+        # boundary, and X-Service-Auth is the app-layer authn that
+        # protects /v1/chat regardless of who can open a TCP socket.
+        self.agent_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Dev: VPC-internal sources reach agent ALB (SSM port-forward via ECS EC2 hosts)",
+        )
+
         # Sandbox tasks accept HTTP only from agent tasks (no ALB).
         self.sandbox_task_sg.add_ingress_rule(
             peer=self.agent_task_sg,
@@ -183,6 +238,87 @@ class NetworkStack(cdk.Stack):
             peer=self.frontend_task_sg,
             connection=ec2.Port.tcp(POSTGRES_PORT),
             description="Frontend tasks to Postgres (Chainlit Data Layer)",
+        )
+
+        # Phoenix wiring. The trust path mirrors the agent ALB:
+        #   agent_task --[ALB_HTTP_PORT=80]--> phoenix_alb_sg     (OTLP)
+        #   frontend_task --[ALB_HTTP_PORT=80]--> phoenix_alb_sg  (UI deep links)
+        #   any VPC-internal source --[ALB_HTTP_PORT=80]--> phoenix_alb_sg
+        #       (covers SSM port-forward sessions through ECS EC2 hosts,
+        #        which run with the ASG's auto-created SG that we don't
+        #        otherwise enumerate. ALB is internal-only — the VPC is
+        #        already the security boundary.)
+        #   phoenix_alb_sg --[PHOENIX_HTTP_PORT=6006]--> phoenix_task_sg
+        #   phoenix_task_sg --[POSTGRES_PORT=5432]--> rds_sg
+        self.phoenix_alb_sg.add_ingress_rule(
+            peer=self.agent_task_sg,
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Agent tasks send OTLP traces to Phoenix ALB",
+        )
+        self.phoenix_alb_sg.add_ingress_rule(
+            peer=self.frontend_task_sg,
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Frontend tasks reach Phoenix UI for deep-link rendering",
+        )
+        self.phoenix_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Dev: VPC-internal sources reach Phoenix UI (SSM port-forward via ECS EC2 hosts)",
+        )
+        self.phoenix_task_sg.add_ingress_rule(
+            peer=self.phoenix_alb_sg,
+            connection=ec2.Port.tcp(PHOENIX_HTTP_PORT),
+            description="Phoenix ALB to Phoenix task (HTTP + OTLP on same port)",
+        )
+        self.rds_sg.add_ingress_rule(
+            peer=self.phoenix_task_sg,
+            connection=ec2.Port.tcp(POSTGRES_PORT),
+            description="Phoenix task to Postgres (Phoenix-owned logical DB)",
+        )
+
+        # Gateway wiring. The trust path replaces direct frontend→agent
+        # ALB calls (which round-robined) with consistent-hash routing
+        # through the gateway:
+        #   frontend_task --[ALB_HTTP_PORT=80]--> gateway_alb_sg
+        #   gateway_alb_sg --[ALB_HTTP_PORT=80]--> gateway_task_sg
+        #   gateway_task_sg --[AGENT_HTTP_PORT=8080]--> agent_task_sg
+        #     (gateway resolves agent task IPs via Cloud Map DNS,
+        #      bypassing the agent ALB which only does round-robin)
+        #   any VPC source --[ALB_HTTP_PORT=80]--> gateway_alb_sg
+        #     (SSM port-forward for eval runner, mirrors agent/phoenix)
+        # NB: the frontend_task → agent_alb rule above stays in place
+        # so direct-to-agent debug paths still work; production traffic
+        # now flows through the gateway.
+        self.gateway_alb_sg.add_ingress_rule(
+            peer=self.frontend_task_sg,
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Frontend tasks to gateway ALB (production /v1/chat path)",
+        )
+        self.gateway_alb_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Dev: VPC-internal sources reach gateway ALB (SSM port-forward via ECS EC2 hosts)",
+        )
+        self.gateway_task_sg.add_ingress_rule(
+            peer=self.gateway_alb_sg,
+            connection=ec2.Port.tcp(ALB_HTTP_PORT),
+            description="Gateway ALB to gateway (HAProxy) tasks",
+        )
+        # ALB target health check hits HAProxy's stats listener on
+        # 8404 (which serves /healthz). Without this rule the check
+        # times out and ECS kills the task in a loop — first deploy
+        # symptom is GatewayService/Service stuck in CREATE_IN_PROGRESS
+        # with "target ... unhealthy due to (reason Request timed out)"
+        # in the service events.
+        self.gateway_task_sg.add_ingress_rule(
+            peer=self.gateway_alb_sg,
+            connection=ec2.Port.tcp(8404),
+            description="Gateway ALB to gateway tasks (HAProxy stats + /healthz)",
+        )
+        self.agent_task_sg.add_ingress_rule(
+            peer=self.gateway_task_sg,
+            connection=ec2.Port.tcp(AGENT_HTTP_PORT),
+            description="Gateway tasks to agent tasks (Cloud-Map-resolved, bypassing agent ALB)",
         )
 
         # ---- Outputs (visible in CloudFormation console) -------------------

@@ -9,19 +9,32 @@ What you get out of the box:
     server.log             — duplicate of stdout, useful for `tail -f`
     strands_traces.jsonl   — Strands' OpenTelemetry spans, one JSON per line
 
-Optional OTLP export (Langfuse, Phoenix, Jaeger, anything OTel-shaped)
+Optional OTLP export (Phoenix, Langfuse, Jaeger, anything OTel-shaped)
 turns on automatically when `OTEL_EXPORTER_OTLP_ENDPOINT` is set —
 Strands' own `setup_otlp_exporter()` reads the standard `OTEL_*`
-environment variables. Example for Langfuse Cloud:
+environment variables. When OTLP is on, two instrumentors are also
+installed:
 
-    export OTEL_EXPORTER_OTLP_ENDPOINT=https://cloud.langfuse.com/api/public/otel
-    export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(public:secret)>"
+  - OpenInference Bedrock instrumentor → wraps boto3 bedrock-runtime
+    calls so LLM child spans carry token counts and per-call cost.
+  - OpenInference Strands Agents instrumentor → rewrites Strands' own
+    AGENT / TOOL spans into OpenInference span kinds so Phoenix's
+    trajectory view, Tool Selection evaluators, and AgentCore-style
+    trajectory metrics work out of the box.
+
+Example for Phoenix (self-hosted internal ALB inside the same VPC):
+
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://<phoenix-alb-dns>
+    export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
     export AGENT_OTLP_ENABLE=1
 
 Env vars consumed here:
 - AGENT_LOG_LEVEL          — default "INFO"
 - AGENT_RUN_DIR            — default "runs"; can be relative or absolute
 - AGENT_OTLP_ENABLE        — "1" / "true" / "yes" to enable OTLP export
+- OTEL_BSP_SCHEDULE_DELAY  — BatchSpanProcessor flush interval (ms);
+                              set to 1000 in deployed agent for snappy
+                              trace appearance, default 5000 in OTel SDK
 """
 
 import logging
@@ -144,10 +157,18 @@ def _setup_strands_telemetry(run_dir: Path) -> IO[str] | None:
         # but Phoenix's token/cost UI is built around OpenInference
         # (llm.token_count.*, llm.model_name). The Bedrock instrumentor
         # patches boto3 bedrock-runtime calls and emits OpenInference-
-        # conformant child spans nested inside Strands' parents — best of
-        # both worlds: agent-level structure from Strands + per-LLM-call
-        # token/cost detail from OpenInference.
+        # conformant child spans nested inside Strands' parents.
+        #
+        # The Strands-Agents → OpenInference processor sits on the
+        # tracer provider and rewrites the *parent* spans (the AGENT /
+        # CHAIN / TOOL / per-cycle spans Strands emits) on the way out,
+        # mapping invoke_agent → AGENT, execute_event_loop_cycle → CHAIN
+        # etc., plus gen_ai.* → llm.*. Without it Phoenix shows the
+        # trace as a wall of generic spans; with it Phoenix renders the
+        # agent trajectory tree natively and Tool Selection / Trajectory
+        # evaluators can read the right attributes.
         _instrument_bedrock_for_openinference()
+        _attach_strands_to_openinference_processor(telemetry)
 
     telemetry.setup_meter(
         enable_console_exporter=False,
@@ -174,6 +195,41 @@ def _instrument_bedrock_for_openinference() -> None:
         log.info("OpenInference Bedrock instrumentation enabled (Phoenix will show tokens + cost)")
     except Exception as e:
         log.warning("OpenInference Bedrock instrumentation failed: %s", e)
+
+
+def _attach_strands_to_openinference_processor(telemetry) -> None:
+    """Attach the Strands→OpenInference span processor to the tracer provider.
+
+    The package ships a span processor (not an Instrumentor) that
+    transforms Strands' OTel-GenAI-shaped spans into OpenInference
+    shape on the way to the exporter. Without it, Phoenix ingests the
+    spans but renders them with unknown `openinference.span.kind`, and
+    trajectory / tool-selection evaluators have nothing to read.
+    """
+    try:
+        from openinference.instrumentation.strands_agents import (
+            StrandsAgentsToOpenInferenceProcessor,
+        )
+    except Exception as e:
+        log.warning("openinference-instrumentation-strands-agents import failed: %s", e)
+        return
+
+    provider = getattr(telemetry, "tracer_provider", None)
+    if provider is None or not hasattr(provider, "add_span_processor"):
+        log.warning(
+            "StrandsTelemetry.tracer_provider missing add_span_processor; "
+            "skipping OpenInference processor"
+        )
+        return
+
+    try:
+        provider.add_span_processor(StrandsAgentsToOpenInferenceProcessor(debug=False))
+        log.info(
+            "OpenInference Strands Agents span processor attached "
+            "(spans will carry openinference.span.kind)"
+        )
+    except Exception as e:
+        log.warning("Strands→OpenInference processor attach failed: %s", e)
 
 
 def _otlp_enabled() -> bool:
